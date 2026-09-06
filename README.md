@@ -103,6 +103,14 @@ shared/            Deployment artifact + MetaMask setup helper, shared across wo
 scripts/           Dev-stack orchestration and rekey smoke tests
 ```
 
+## Supervision
+
+This project was developed as part of a PhD research programme at the **University of Nicosia**, under the supervision of:
+
+- Harald Gjermundrod — gjermundrod.h@unic.ac.cy
+- Ioanna Dionysiou — dionysiou.i@unic.ac.cy
+- Elias Iosif — iosif.e@unic.ac.cy
+
 ## Acknowledgments
 
 Frontend built in collaboration with Ranya Rizki (ranya.rizki@etu.univ-tours.fr).
