@@ -1,0 +1,42 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Environment variables — NEVER commit secrets
+.env
+.env.*
+!.env.example
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Root node_modules (hoisted by npm workspaces)
+node_modules/
+
+# Unrelated tool state accidentally created inside SmartContracts/ by a
+# sandboxed shell (Salesforce CLI cache, scratch HOME) — never project content
+SmartContracts/.sfdx/
+SmartContracts/.tmp_home/
+
+# Build outputs (also ignored per-workspace)
+dist/
+build/
+
+# Runtime logs from dev-up.sh
+.dev/
+
+# Localhost deployment artifacts are per-developer (each runs their own
+# Hardhat node), so they should not be committed. Shared networks
+# (sepolia, mainnet, etc.) ARE committed so the frontend always has the
+# latest ABI after `git pull`.
+shared/deployments/localhost.json
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

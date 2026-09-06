@@ -1,0 +1,34 @@
+{
+  "name": "privacychain",
+  "version": "1.0.0",
+  "description": "PrivacyChain monorepo — smart contracts + L2 key management + L3 encrypted storage + frontend",
+  "private": true,
+  "workspaces": [
+    "SmartContracts",
+    "L2",
+    "L3",
+    "Frontend"
+  ],
+  "scripts": {
+    "dev": "bash scripts/dev-up.sh",
+    "dev:no-seed": "bash scripts/dev-up.sh --no-seed",
+    "contracts:node": "npm run node --workspace=SmartContracts",
+    "contracts:deploy:local": "npm run deploy:local --workspace=SmartContracts",
+    "contracts:deploy:sepolia": "npm run deploy:sepolia --workspace=SmartContracts",
+    "contracts:seed:local": "npm run seed:local --workspace=SmartContracts",
+    "contracts:demo": "npm run demo --workspace=SmartContracts",
+    "contracts:test": "npm test --workspace=SmartContracts",
+    "l2:dev": "npm run dev --workspace=L2",
+    "l3:dev": "npm run dev --workspace=L3",
+    "frontend:dev": "npm run dev --workspace=Frontend",
+    "frontend:build": "npm run build --workspace=Frontend",
+    "test:e2e": "npm run test:e2e --workspace=Frontend",
+    "test": "npm run contracts:test && npm run test:e2e"
+  },
+  "keywords": [],
+  "author": "Pierre Ghaly",
+  "license": "ISC",
+  "overrides": {
+    "@coinbase/cdp-sdk": "1.51.0"
+  }
+}

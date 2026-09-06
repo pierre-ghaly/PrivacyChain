@@ -1,0 +1,28 @@
+{
+  "name": "l3-encrypted-storage",
+  "version": "1.0.0",
+  "description": "PrivacyChain L3 — Encrypted Storage Service (Helia IPFS simulation)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@helia/unixfs": "^3.0.6",
+    "better-sqlite3": "^9.6.0",
+    "blockstore-fs": "^1.1.11",
+    "datastore-fs": "^9.1.8",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helia": "^4.2.6"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3"
+  }
+}

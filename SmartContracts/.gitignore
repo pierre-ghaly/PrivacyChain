@@ -1,0 +1,25 @@
+# Node modules
+node_modules/
+
+# Hardhat
+cache/
+artifacts/
+typechain-types/
+
+# Temporary files
+.tmp_home/
+.DS_Store
+
+# Environment variables (do not commit secrets)
+.env
+.env.*
+!.env.example
+
+# Hardhat ignition cache
+ignition/deployments/
+
+# OpenZeppelin upgrades metadata (contains deployment manifests / addresses)
+.openzeppelin/
+
+# Compiled typescript
+dist/

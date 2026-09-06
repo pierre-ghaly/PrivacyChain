@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>PrivacyChain — Local Dev Setup</title>
+<style>
+  :root{
+    --bg:#0b1020; --panel:#121831; --line:#1e2746; --ink:#e7ecff;
+    --muted:#8892b0; --accent:#7c5cff; --accent2:#3ddc97; --danger:#ff6b6b;
+    --warn:#ffbd69;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:820px;margin:40px auto;padding:0 20px}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:17px;margin:26px 0 10px;letter-spacing:.2px}
+  .sub{color:var(--muted);margin-bottom:22px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:22px;margin:14px 0}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .pill{display:inline-flex;align-items:center;gap:8px;padding:4px 10px;border-radius:999px;
+    font-size:12px;font-weight:600;border:1px solid var(--line)}
+  .pill.ok{color:var(--accent2);border-color:rgba(61,220,151,.4)}
+  .pill.no{color:var(--danger);border-color:rgba(255,107,107,.4)}
+  .pill.warn{color:var(--warn);border-color:rgba(255,189,105,.4)}
+  button{appearance:none;border:0;cursor:pointer;font:inherit;font-weight:600;
+    padding:11px 16px;border-radius:10px;background:var(--accent);color:white;transition:.15s}
+  button:hover{filter:brightness(1.1)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  button.ok{background:var(--accent2);color:#052412}
+  code,pre{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:13px}
+  code.kv{background:#0a0f22;border:1px solid var(--line);padding:2px 7px;border-radius:6px;color:#c7d2fe}
+  pre{background:#0a0f22;border:1px solid var(--line);padding:12px;border-radius:10px;
+    overflow:auto;color:#c7d2fe}
+  .grid{display:grid;grid-template-columns:140px 1fr;gap:8px 16px;align-items:center}
+  .grid > div:nth-child(odd){color:var(--muted)}
+  ol{padding-left:22px}
+  ol li{margin:6px 0}
+  a{color:#9bb1ff}
+  .toast{position:fixed;right:20px;bottom:20px;background:var(--panel);
+    border:1px solid var(--line);padding:10px 14px;border-radius:10px;
+    opacity:0;transform:translateY(8px);transition:.2s}
+  .toast.show{opacity:1;transform:translateY(0)}
+  .muted{color:var(--muted)}
+  .mini{font-size:12px;color:var(--muted)}
+  .break{word-break:break-all}
+  .danger{color:var(--danger)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>PrivacyChain — Local Dev Setup</h1>
+  <div class="sub">A one-page helper to get MetaMask connected to your local Hardhat node.</div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <strong>MetaMask detection</strong>
+        <div class="mini">The page talks to MetaMask via <code>window.ethereum</code>.</div>
+      </div>
+      <span id="mmPill" class="pill warn">checking…</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <strong>Local deployment</strong>
+        <div class="mini">Read from <code>shared/deployments/localhost.json</code>.</div>
+      </div>
+      <span id="depPill" class="pill warn">loading…</span>
+    </div>
+    <div id="depInfo" class="grid" style="margin-top:14px;display:none">
+      <div>Network</div>        <div><code class="kv" id="dNet">—</code></div>
+      <div>Chain ID</div>       <div><code class="kv" id="dChain">—</code></div>
+      <div>AssetRegistry</div>  <div><code class="kv break" id="dAddr">—</code></div>
+      <div>Deployed at</div>    <div><code class="kv" id="dTime">—</code></div>
+    </div>
+  </div>
+
+  <h2>Step 1 — Add the Hardhat network to MetaMask</h2>
+  <div class="card">
+    <p class="muted" style="margin-top:0">
+      Click below. MetaMask will open with every field pre-filled —
+      just press <strong>Approve</strong>. Uses the standard
+      <code>wallet_addEthereumChain</code> RPC method
+      (<a target="_blank" href="https://eips.ethereum.org/EIPS/eip-3085">EIP-3085</a>).
+    </p>
+    <div class="row">
+      <button id="btnAddChain">Add Hardhat Localhost to MetaMask</button>
+      <span id="addStatus" class="mini"></span>
+    </div>
+  </div>
+
+  <h2>Step 2 — Import a pre-funded test account</h2>
+  <div class="card">
+    <p class="muted" style="margin-top:0">
+      MetaMask does not allow websites to import private keys
+      (for good reason). Copy the key below, then in MetaMask:
+      <em>account menu → Import account → paste → Import</em>.
+      You'll instantly have <strong>10,000 test ETH</strong>.
+    </p>
+
+    <div class="grid" style="margin-bottom:10px">
+      <div>Address</div>
+      <div><code class="kv break">0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266</code></div>
+      <div>Private key</div>
+      <div><code class="kv break" id="pk">0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80</code></div>
+    </div>
+    <div class="row">
+      <button id="btnCopyPk" class="ok">Copy private key</button>
+      <span class="mini danger">
+        Publicly known key — never send real funds to this address.
+        Label the imported account "Hardhat — Unsafe".
+      </span>
+    </div>
+
+    <details style="margin-top:18px">
+      <summary class="muted" style="cursor:pointer">Need a different test account? (Accounts #1–#4)</summary>
+      <div style="margin-top:10px" id="moreAccounts"></div>
+    </details>
+  </div>
+
+  <h2>Step 3 — Start testing</h2>
+  <div class="card">
+    <ol>
+      <li>Make sure MetaMask is on <strong>Hardhat Localhost</strong> (top-left network selector).</li>
+      <li>Make sure the active account is the imported "Hardhat — Unsafe" one.</li>
+      <li>Open the frontend: <a id="feLink" href="http://localhost:5173" target="_blank">http://localhost:5173</a>
+        <span class="mini">(Vite default — adjust if your frontend uses a different port)</span></li>
+      <li>Click "Connect Wallet" in the frontend. It will pick up the deployed contract from
+        <code>shared/deployments/localhost.json</code> automatically.</li>
+    </ol>
+    <div class="mini">
+      <strong>Tip:</strong> If MetaMask complains about "nonce too high" after a node restart:
+      MetaMask → Settings → Advanced → <em>Clear activity tab data</em>.
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+const HARDHAT = {
+  chainId:"0x7a69",               // 31337
+  chainName:"Hardhat Localhost",
+  nativeCurrency:{name:"Ether",symbol:"ETH",decimals:18},
+  rpcUrls:["http://127.0.0.1:8545"],
+  blockExplorerUrls:[]
+};
+
+const HARDHAT_ACCOUNTS = [
+  ["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266","0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"],
+  ["0x70997970C51812dc3A010C7d01b50e0d17dc79C8","0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"],
+  ["0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC","0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"],
+  ["0x90F79bf6EB2c4f870365E785982E1f101E93b906","0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6"],
+  ["0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65","0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a"],
+];
+
+const toast = (msg, isErr=false) => {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.style.borderColor = isErr ? "rgba(255,107,107,.5)" : "var(--line)";
+  t.classList.add("show");
+  setTimeout(()=>t.classList.remove("show"), 2500);
+};
+
+// --- MetaMask detection ---
+function updateMmPill() {
+  const pill = document.getElementById("mmPill");
+  if (window.ethereum && (window.ethereum.isMetaMask || window.ethereum.providers?.some(p=>p.isMetaMask))) {
+    pill.className = "pill ok"; pill.textContent = "detected";
+    document.getElementById("btnAddChain").disabled = false;
+  } else {
+    pill.className = "pill no"; pill.textContent = "not detected";
+    document.getElementById("btnAddChain").disabled = true;
+    document.getElementById("addStatus").textContent =
+      "Install MetaMask from metamask.io, then refresh this page.";
+  }
+}
+updateMmPill();
+if (!window.ethereum) {
+  // In case the extension injects late
+  window.addEventListener("ethereum#initialized", updateMmPill, { once:true });
+  setTimeout(updateMmPill, 800);
+}
+
+// --- Add chain ---
+document.getElementById("btnAddChain").onclick = async () => {
+  const status = document.getElementById("addStatus");
+  try {
+    status.textContent = "Opening MetaMask…";
+    status.style.color = "";
+    await window.ethereum.request({
+      method: "wallet_addEthereumChain",
+      params: [HARDHAT],
+    });
+    status.textContent = "✓ Network added / switched.";
+    status.style.color = "var(--accent2)";
+  } catch (e) {
+    // MetaMask throws when the chain already exists — that's fine, it just means
+    // Hardhat Localhost is already in your network list. Select it manually.
+    const msg = e?.message || "";
+    if (e?.code === -32602 || msg.toLowerCase().includes("already") || msg.toLowerCase().includes("exist")) {
+      status.textContent = "Network already in MetaMask — select it from the network list.";
+      status.style.color = "var(--warn)";
+    } else {
+      status.textContent = "✗ " + (msg || "Failed");
+      status.style.color = "var(--danger)";
+    }
+  }
+};
+
+// --- Copy PK ---
+document.getElementById("btnCopyPk").onclick = async () => {
+  await navigator.clipboard.writeText(document.getElementById("pk").textContent.trim());
+  toast("Private key copied. Paste it into MetaMask → Import account.");
+};
+
+// --- Extra accounts ---
+const more = document.getElementById("moreAccounts");
+HARDHAT_ACCOUNTS.slice(1).forEach(([addr, pk], i) => {
+  const row = document.createElement("div");
+  row.style.cssText = "margin:8px 0;padding:10px;border:1px solid var(--line);border-radius:8px";
+  row.innerHTML = `
+    <div class="mini" style="margin-bottom:4px">Account #${i+1}</div>
+    <div style="margin-bottom:6px"><code class="kv break">${addr}</code></div>
+    <div class="row">
+      <code class="kv break" style="flex:1;min-width:0">${pk}</code>
+      <button class="ghost" data-pk="${pk}">Copy</button>
+    </div>`;
+  row.querySelector("button").onclick = async (ev) => {
+    await navigator.clipboard.writeText(ev.target.dataset.pk);
+    toast("Private key copied.");
+  };
+  more.appendChild(row);
+});
+
+// --- Load deployment info ---
+(async () => {
+  const pill = document.getElementById("depPill");
+  try {
+    const r = await fetch("deployments/localhost.json", { cache: "no-store" });
+    if (!r.ok) throw new Error("not found");
+    const d = await r.json();
+    pill.className = "pill ok"; pill.textContent = "deployed";
+    document.getElementById("depInfo").style.display = "grid";
+    document.getElementById("dNet").textContent = d.network;
+    document.getElementById("dChain").textContent = d.chainId;
+    document.getElementById("dAddr").textContent =
+      d.contracts?.AssetRegistry?.address ?? "(missing)";
+    document.getElementById("dTime").textContent =
+      new Date(d.deployedAt).toLocaleString();
+  } catch {
+    pill.className = "pill no"; pill.textContent = "not deployed";
+  }
+})();
+</script>
+</body>
+</html>
