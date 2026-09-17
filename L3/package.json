@@ -16,7 +16,7 @@
     "datastore-fs": "^9.1.8",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "helia": "^4.2.6"
+    "helia": "^7.1.12"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
