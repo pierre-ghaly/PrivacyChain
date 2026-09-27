@@ -1,6 +1,6 @@
 'use client';
 import { useEffect, useRef, useState } from "react";
-import { useWriteContract, useSignMessage } from "wagmi";
+import { useWriteContract, useSignMessage, useReadContract } from "wagmi";
 import { toast } from "sonner";
 import { Card } from "@/components/card";
 import { ASSET_REGISTRY_ADDRESS, ASSET_REGISTRY_ABI, L2_SERVER_URL } from "@/contracts";
@@ -19,6 +19,8 @@ interface PendingMetadata {
   description: string;
   category: string;
   imageFile: File | null;
+  isPublic: boolean;
+  visibilityDiffersFromDefault: boolean;
 }
 
 function fileToBase64(file: File): Promise<string> {
@@ -43,6 +45,24 @@ export function CreateAssetForm() {
   const { writeContractAsync } = useWriteContract();
   const { signMessageAsync } = useSignMessage();
 
+  // Platform-wide default for new assets — a forward-looking admin policy
+  // (see AssetRegistry.sol's platformDefaultAssetVisibility). The toggle
+  // below pre-fills from this but the owner can override per-asset.
+  const { data: platformDefaultAssetVisibility } = useReadContract({
+    address: ASSET_REGISTRY_ADDRESS,
+    abi: ASSET_REGISTRY_ABI,
+    functionName: 'platformDefaultAssetVisibility',
+  });
+
+  const [isPublic, setIsPublic] = useState(false);
+  const [visibilityTouched, setVisibilityTouched] = useState(false);
+
+  useEffect(() => {
+    if (!visibilityTouched && typeof platformDefaultAssetVisibility === 'boolean') {
+      setIsPublic(platformDefaultAssetVisibility);
+    }
+  }, [platformDefaultAssetVisibility, visibilityTouched]);
+
   const pendingMetadata = useRef<PendingMetadata | null>(null);
 
   // revoke the object URL on unmount so it doesn't leak
@@ -60,6 +80,21 @@ export function CreateAssetForm() {
       if (detail.assetName !== pending.assetName) return;
 
       pendingMetadata.current = null;
+
+      if (pending.visibilityDiffersFromDefault && detail.assetId) {
+        try {
+          await writeContractAsync({
+            address: ASSET_REGISTRY_ADDRESS,
+            abi: ASSET_REGISTRY_ABI,
+            functionName: 'setAssetVisibility',
+            args: [BigInt(detail.assetId), pending.isPublic],
+          });
+        } catch (err) {
+          console.error(err);
+          toast.error("Asset minted, but setting its visibility failed — it's using the platform default for now.");
+        }
+      }
+
       try {
         const authHeader = await getAuthHeader(detail.user, signMessageAsync);
 
@@ -104,7 +139,14 @@ export function CreateAssetForm() {
     const toastId = toast.loading("Initiating minting transaction...");
 
     try {
-      pendingMetadata.current = { assetName, description, category, imageFile };
+      pendingMetadata.current = {
+        assetName,
+        description,
+        category,
+        imageFile,
+        isPublic,
+        visibilityDiffersFromDefault: isPublic !== !!platformDefaultAssetVisibility,
+      };
 
       await writeContractAsync({
         address: ASSET_REGISTRY_ADDRESS,
@@ -122,6 +164,7 @@ export function CreateAssetForm() {
         if (prev) URL.revokeObjectURL(prev);
         return null;
       });
+      setVisibilityTouched(false);
     } catch (error: any) {
       pendingMetadata.current = null;
       console.error(error);
@@ -195,6 +238,32 @@ export function CreateAssetForm() {
               });
             }}
           />
+        </div>
+
+        <div className="flex items-center justify-between p-4 rounded-xl border border-gray-100 bg-gray-50/30">
+          <div>
+            <span className="block text-sm font-bold">Make this asset public</span>
+            <span className="block text-[11px] text-gray-400 mt-0.5">
+              Visible on the Explorer to other visitors. This is your own choice — an admin can only set the
+              platform-wide default for new assets, never change an existing asset's visibility.
+            </span>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={isPublic}
+            onClick={() => {
+              setVisibilityTouched(true);
+              setIsPublic((prev) => !prev);
+            }}
+            className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${isPublic ? "bg-black" : "bg-gray-200"}`}
+          >
+            <span
+              className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${
+                isPublic ? "translate-x-5" : "translate-x-0"
+              }`}
+            />
+          </button>
         </div>
 
         <button

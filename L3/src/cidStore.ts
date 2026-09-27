@@ -3,10 +3,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { config } from './config.js';
 
-// L3's own (txId, dataType) -> CID index. Previously this lived in L2
-// (round-tripping through POST /keys/cids after every store); now L3 is
-// fully self-contained for resolving its own data, and L2 never sees a CID
-// at all for the metadata lookup path (see GET /retrieve/by-tx/:txId).
+// L3's own (txId, dataType) -> CID index — kept local so L3 can resolve
+// its own data without L2 tracking CIDs (see GET /retrieve/by-tx/:txId).
 let db: Database.Database | null = null;
 
 function getDb(): Database.Database {

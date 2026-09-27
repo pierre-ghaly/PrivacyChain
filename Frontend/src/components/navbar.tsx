@@ -29,11 +29,22 @@ export default function Navbar() {
   // Only evaluate wallet state after client mount to avoid SSR/client mismatch
   const isAdmin = mounted && isConnected && !!address && !!isAdminRole;
 
+  // Plain view read, no wallet needed — lets a fully disconnected visitor's
+  // navbar reflect the platform's current Explorer access mode too.
+  const { data: explorerAccessMode } = useReadContract({
+    address: ASSET_REGISTRY_ADDRESS,
+    abi: ASSET_REGISTRY_ABI,
+    functionName: 'explorerAccessMode',
+    query: { enabled: mounted },
+  });
+  const isExplorerPublic = Number(explorerAccessMode ?? 0) === 1;
+  const canBrowseExplorer = isAdmin || isExplorerPublic;
+
   return (
     <nav className="flex items-center justify-between px-8 py-5 border-b border-gray-100 bg-white">
       <div className="flex items-center gap-12">
         <Link href="/" className="text-xl font-semibold tracking-tight text-black">
-          blockchain<span className="text-gray-400">.</span>
+          PrivacyChain<span className="text-gray-400">.</span>
         </Link>
 
         {mounted && isConnected && (
@@ -57,9 +68,9 @@ export default function Navbar() {
               Settings
             </Link>
             
-            {isAdmin && (
-            <Link 
-              href="/dashboard/explorer" 
+            {canBrowseExplorer && (
+            <Link
+              href="/dashboard/explorer"
               className={`text-sm font-medium transition-colors ${pathname === '/dashboard/explorer' ? 'text-black' : 'text-gray-400 hover:text-black'}`}
             >
               Explorer
@@ -67,13 +78,27 @@ export default function Navbar() {
             )}
 
             {isAdmin && (
-              <Link 
-                href="/admin" 
+              <Link
+                href="/admin"
                 className={`text-sm font-bold transition-colors ${pathname === '/admin' ? 'text-red-600' : 'text-red-400 hover:text-red-600'}`}
               >
                 Admin Panel
               </Link>
             )}
+          </div>
+        )}
+
+        {/* A fully disconnected visitor still gets an Explorer link when the
+            platform allows anonymous browsing — the connected-only block
+            above never renders for them. */}
+        {mounted && !isConnected && isExplorerPublic && (
+          <div className="hidden md:flex items-center gap-8">
+            <Link
+              href="/dashboard/explorer"
+              className={`text-sm font-medium transition-colors ${pathname === '/dashboard/explorer' ? 'text-black' : 'text-gray-400 hover:text-black'}`}
+            >
+              Explorer
+            </Link>
           </div>
         )}
       </div>

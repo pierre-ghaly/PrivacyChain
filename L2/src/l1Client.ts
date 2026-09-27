@@ -29,38 +29,25 @@ export async function isAdminL1(address: string): Promise<boolean> {
   return (contract as any).hasRole(ADMIN_ROLE_HASH, address);
 }
 
-export interface L1Valuation {
-  certifier: string;
-  value: bigint;
-  currencyCode: string;   // bytes3 decoded as UTF-8
-  certifiedAt: bigint;
-}
-
 export interface L1AssetDetail {
   id: bigint;
   name: string;
-  status: number;         // 0 = PENDING, 1 = ACTIVE
+  status: number;         // 0 = PENDING, 1 = ACTIVE, 2 = REJECTED
   createdAt: bigint;
   exists: boolean;
   owner: string;
-  valuations: L1Valuation[];
+  isPublic: boolean;
 }
 
 function decodeAssetDetail(raw: any): L1AssetDetail {
   return {
-    id:         raw.id,
-    name:       raw.name,
-    status:     Number(raw.status),
-    createdAt:  raw.createdAt,
-    exists:     raw.exists,
-    owner:      raw.owner,
-    valuations: (raw.valuations ?? []).map((v: any) => ({
-      certifier:    v.certifier,
-      value:        v.value,
-      // bytes3 comes back as a 0x-prefixed hex string; decode to UTF-8 label
-      currencyCode: Buffer.from(v.currencyCode.slice(2), 'hex').toString('utf8').replace(/\0/g, ''),
-      certifiedAt:  v.certifiedAt,
-    })),
+    id:        raw.id,
+    name:      raw.name,
+    status:    Number(raw.status),
+    createdAt: raw.createdAt,
+    exists:    raw.exists,
+    owner:     raw.owner,
+    isPublic:  raw.isPublic,
   };
 }
 
@@ -74,4 +61,14 @@ export async function getAllAssetsDetailL1(): Promise<L1AssetDetail[]> {
   const contract = getContract();
   const raw: any[] = await (contract as any).getAllAssetsDetail();
   return raw.map(decodeAssetDetail);
+}
+
+// Whether a specific asset should be visible to a caller with no owner/admin
+// relationship to it — the contract's own AND-logic check (asset.isPublic &&
+// owner's per-user assetsPublic flag), mode-gated on explorerAccessMode.
+// Needed because userConfigs is a private mapping on-chain (no auto-generated
+// getter), so this is the only way an off-chain caller can evaluate it.
+export async function isAssetPubliclyVisibleL1(assetId: string): Promise<boolean> {
+  const contract = getContract();
+  return (contract as any).isAssetPubliclyVisible(BigInt(assetId));
 }

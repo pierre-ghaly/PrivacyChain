@@ -21,7 +21,7 @@ export interface UserPii {
  * All descriptive, financial-document, and media references live here.
  *
  * Layer mapping:
- *   L1 (public)  — id, name (pseudonym), status, timestamps, Valuation[] (certifier + value)
+ *   L1 (public)  — id, name (pseudonym), status, timestamps, isPublic
  *   L3 (private) — description, category, metadata key-values, image CIDs
  */
 export interface AssetMetadata {
@@ -50,4 +50,17 @@ export interface AssetMetadata {
    * Retrieve images via GET /retrieve/:cid?txId=<txId>.
    */
   imageCids?: string[];
+}
+
+/**
+ * VALUATION / SALE_PRICE — stored behind a requestFinancialAssertion() txId
+ * minted on L1 (no counterparty for VALUATION, buyer address for SALE_PRICE).
+ * The PENDING/CONFIRMED/APPROVED/REJECTED lifecycle lives in L2's SQLite, not
+ * here — L3 just encrypts/decrypts the figure like any other blob.
+ */
+export interface FinancialAssertionContent {
+  value: string;
+  currencyCode: string;
+  /** Certifying party's name, for a solo valuation with no on-chain counterparty. */
+  entity?: string;
 }

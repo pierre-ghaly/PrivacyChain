@@ -18,17 +18,6 @@ export function rekeyRouter(): Router {
   // passed in the request. The old CID is resolved internally via L3's own
   // index — L2 doesn't track CIDs at all, it only knows txIds.
   //
-  // Flow:
-  //   1. Resolve oldCid from L3's own index for (oldTxId, dataType) — 404 if
-  //      nothing was ever stored under oldTxId (nothing to migrate)
-  //   2. Fetch old + new Kr from L2
-  //   3. Fetch the old encrypted blob from IPFS, decrypt with old Kr
-  //   4. For each image CID referenced in metadata: fetch, decrypt (old Kr),
-  //      re-encrypt (new Kr), re-pin — collect new CIDs
-  //   5. Re-encrypt the metadata (with updated imageCids) under new Kr, pin,
-  //      and register the new (newTxId, dataType) -> CID mapping locally
-  //   6. Return the new metadata CID + new image CIDs
-  //
   // The old blob(s) are left exactly as they are — IPFS never deletes —
   // they simply become unreferenced once L2 repoints asset_txids.
   router.post('/', async (req, res) => {

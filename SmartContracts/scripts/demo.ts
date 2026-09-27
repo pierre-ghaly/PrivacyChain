@@ -5,12 +5,16 @@ import * as path from "path";
 /**
  * End-to-end RTBF demonstration script.
  *
- * Drives the full 9-step flow across all three layers without a Frontend:
+ * Drives the full 9-step flow across all three layers without a Frontend,
+ * routing every L3 call through L2's real signed-session gateway exactly
+ * as the Frontend does — L3 rejects any direct (non-L2) caller by design,
+ * so this script authenticates as Dave (a SIWE-lite nonce + signature)
+ * before touching /l3/*.
  *   Steps 1–3  → L1 on-chain operations (register, approve, create asset)
- *   Steps 4–5  → L3 encrypted storage (store USER_PII + ASSET_METADATA)
- *   Step  6    → L3 retrieve (before erasure — expect 200)
+ *   Steps 4–5  → L2 gateway → L3 encrypted storage (USER_PII + ASSET_METADATA)
+ *   Step  6    → L2 gateway → L3 retrieve (before erasure — expect 200)
  *   Step  7    → L1 RTBF exit (requestExit → L2 destroys keys → L1 proof)
- *   Step  8    → L3 retrieve (after erasure — expect 410)
+ *   Step  8    → L2 gateway → L3 retrieve (after erasure — expect 410)
  *   Step  9    → L1 + L2 audit verification
  *
  * Prerequisites:
@@ -71,15 +75,44 @@ async function waitForKey(txId: string, label: string, timeoutMs = 10_000): Prom
 }
 
 async function waitForErasure(userAddress: string, timeoutMs = 15_000): Promise<void> {
-  log(`Waiting for L2 to complete erasure for ${userAddress}...`);
+  log(`Waiting for L2 to destroy keys for ${userAddress}...`);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const res  = await fetch(`${L2}/status/${userAddress}`);
     const body = (await res.json()) as { erasureComplete: boolean; destroyedKeys: number; totalKeys: number };
-    if (body.erasureComplete) { ok(`Erasure confirmed (${body.destroyedKeys}/${body.totalKeys} keys destroyed).`); return; }
+    if (body.erasureComplete) { ok(`Keys destroyed (${body.destroyedKeys}/${body.totalKeys}).`); return; }
     await sleep(400);
   }
-  throw new Error(`Timeout: L2 erasure did not complete for ${userAddress} within ${timeoutMs}ms`);
+  throw new Error(`Timeout: L2 did not finish destroying keys for ${userAddress} within ${timeoutMs}ms`);
+}
+
+// `/status/:user`'s erasureComplete flips the instant L2 destroys keys
+// locally — before it has even submitted recordErasureProof() to L1, let
+// alone had it mined. Anything reading getErasureProof() (Step 9) needs to
+// wait on that L1 confirmation specifically, not on L2's local key state.
+async function waitForProofOnChain(
+  registry: { getExitStatus: (addr: string) => Promise<[boolean, bigint, boolean]> },
+  userAddress: string,
+  timeoutMs = 15_000,
+): Promise<void> {
+  log(`Waiting for L2 to record the erasure proof on L1 for ${userAddress}...`);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const [, , hasProof] = await registry.getExitStatus(userAddress);
+    if (hasProof) { ok(`Erasure proof confirmed on L1.`); return; }
+    await sleep(400);
+  }
+  throw new Error(`Timeout: erasure proof was not recorded on L1 for ${userAddress} within ${timeoutMs}ms`);
+}
+
+// L2 is the only path to L3: every /l3/* call needs a signed SIWE-lite
+// session, obtained by signing the exact nonce message L2 issues. Never
+// construct the message locally — always sign what L2 sent.
+async function authHeader(wallet: { address: string; signMessage: (m: string) => Promise<string> }): Promise<string> {
+  const nonceRes = await fetch(`${L2}/auth/nonce?address=${wallet.address}`);
+  const { message } = (await nonceRes.json()) as { message: string };
+  const signature = await wallet.signMessage(message);
+  return `${wallet.address} ${signature}`;
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────
@@ -155,8 +188,11 @@ async function main() {
   await waitForKey(regTxId,   "registration");
   await waitForKey(assetTxId, "asset");
 
+  // Sign in once — the same SIWE-lite session covers every /l3/* call below
+  const auth = await authHeader(dave);
+
   // ── Step 4: Store USER_PII ────────────────────────────────────────────────
-  banner(4, "Store USER_PII  (L3: POST /store)");
+  banner(4, "Store USER_PII  (via L2 gateway: POST /l3/store)");
   const piiPayload = {
     txId:     regTxId,
     dataType: "USER_PII",
@@ -167,20 +203,20 @@ async function main() {
       address: "123 Privacy Lane, GDPR City",
     },
   };
-  const storeRes = await fetch(`${L3}/store`, {
+  const storeRes = await fetch(`${L2}/l3/store`, {
     method:  "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Authorization: auth },
     body:    JSON.stringify(piiPayload),
   });
   const stored = (await storeRes.json()) as { ok: boolean; cid: string };
-  if (!stored.ok) throw new Error(`L3 /store failed: ${JSON.stringify(stored)}`);
+  if (!stored.ok) throw new Error(`L2 /l3/store failed: HTTP ${storeRes.status} ${JSON.stringify(stored)}`);
   const piiCid = stored.cid;
   ok(`USER_PII stored.`);
   info(`CID:  ${piiCid}`);
   info(`Blob: AES-256-GCM encrypted, pinned to local Helia IPFS`);
 
   // ── Step 5: Store ASSET_METADATA ─────────────────────────────────────────
-  banner(5, "Store ASSET_METADATA  (L3: POST /store)");
+  banner(5, "Store ASSET_METADATA  (via L2 gateway: POST /l3/store)");
   const metaPayload = {
     txId:     assetTxId,
     dataType: "ASSET_METADATA",
@@ -192,28 +228,28 @@ async function main() {
       owner:       dave.address,
     },
   };
-  const assetStoreRes = await fetch(`${L3}/store`, {
+  const assetStoreRes = await fetch(`${L2}/l3/store`, {
     method:  "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", Authorization: auth },
     body:    JSON.stringify(metaPayload),
   });
   const assetStored = (await assetStoreRes.json()) as { ok: boolean; cid: string };
-  if (!assetStored.ok) throw new Error(`L3 /store failed: ${JSON.stringify(assetStored)}`);
+  if (!assetStored.ok) throw new Error(`L2 /l3/store failed: ${JSON.stringify(assetStored)}`);
   const assetCid = assetStored.cid;
   ok(`ASSET_METADATA stored.`);
   info(`CID: ${assetCid}`);
 
   // ── Step 6: Retrieve (before erasure) ─────────────────────────────────────
-  banner(6, "Retrieve Data  (before RTBF — expect HTTP 200)");
+  banner(6, "Retrieve Data  (before RTBF, via L2 gateway — expect HTTP 200)");
 
-  const r1  = await fetch(`${L3}/retrieve/${piiCid}?txId=${regTxId}`);
+  const r1  = await fetch(`${L2}/l3/retrieve/${piiCid}?txId=${regTxId}`, { headers: { Authorization: auth } });
   const r1b = (await r1.json()) as { data: unknown };
-  log(`GET /retrieve/${piiCid}?txId=${regTxId}`);
+  log(`GET /l3/retrieve/${piiCid}?txId=${regTxId}`);
   ok(`HTTP ${r1.status}  →  ${JSON.stringify(r1b.data)}`);
 
-  const r2  = await fetch(`${L3}/retrieve/${assetCid}?txId=${assetTxId}`);
+  const r2  = await fetch(`${L2}/l3/retrieve/${assetCid}?txId=${assetTxId}`, { headers: { Authorization: auth } });
   const r2b = (await r2.json()) as { data: unknown };
-  log(`GET /retrieve/${assetCid}?txId=${assetTxId}`);
+  log(`GET /l3/retrieve/${assetCid}?txId=${assetTxId}`);
   ok(`HTTP ${r2.status}  →  ${JSON.stringify(r2b.data)}`);
 
   // ── Step 7: RTBF exit ─────────────────────────────────────────────────────
@@ -229,23 +265,25 @@ async function main() {
   await waitForErasure(dave.address.toLowerCase());
 
   // ── Step 8: Retrieve (after erasure) ─────────────────────────────────────
-  banner(8, "Retrieve Data  (after RTBF — expect HTTP 410)");
+  banner(8, "Retrieve Data  (after RTBF, via L2 gateway — expect HTTP 410)");
 
-  const e1  = await fetch(`${L3}/retrieve/${piiCid}?txId=${regTxId}`);
+  const e1  = await fetch(`${L2}/l3/retrieve/${piiCid}?txId=${regTxId}`, { headers: { Authorization: auth } });
   const e1b = (await e1.json()) as { error: string; note?: string };
-  log(`GET /retrieve/${piiCid}?txId=${regTxId}`);
+  log(`GET /l3/retrieve/${piiCid}?txId=${regTxId}`);
   ok(`HTTP ${e1.status}`);
   info(`error: ${e1b.error}`);
   if (e1b.note) info(`note:  ${e1b.note}`);
 
-  const e2  = await fetch(`${L3}/retrieve/${assetCid}?txId=${assetTxId}`);
+  const e2  = await fetch(`${L2}/l3/retrieve/${assetCid}?txId=${assetTxId}`, { headers: { Authorization: auth } });
   const e2b = (await e2.json()) as { error: string };
-  log(`GET /retrieve/${assetCid}?txId=${assetTxId}`);
+  log(`GET /l3/retrieve/${assetCid}?txId=${assetTxId}`);
   ok(`HTTP ${e2.status}`);
   info(`error: ${e2b.error}`);
 
   // ── Step 9: Audit verification ────────────────────────────────────────────
   banner(9, "Audit Verification  (L1 + L2)");
+
+  await waitForProofOnChain(registry as any, dave.address);
 
   const proofHash          = await registry.getErasureProof(dave.address);
   const [exited, exitTs, hasProof] = await registry.getExitStatus(dave.address);

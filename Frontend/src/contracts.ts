@@ -8,9 +8,6 @@ export const SYSTEM_ADDRESS = deployment.systemAddress as `0x${string}`; // defa
 // directly; L2 is the sole gateway (see L2/src/routes/l3proxy.ts).
 export const L2_SERVER_URL = process.env.NEXT_PUBLIC_L2_SERVER_URL || "http://127.0.0.1:3001";
 
-// bytes3 ASCII encodings matching SmartContracts/scripts/seed.ts — must stay
-// byte-exact with what addValuation() expects on-chain.
-export const CURRENCY_OPTIONS = [
-  { code: "USD", hex: "0x555344" },
-  { code: "EUR", hex: "0x455552" },
-] as const;
+// Financial assertions (valuations, sale price) are off-chain L3 content —
+// no bytes3 on-chain encoding constraint applies anymore, just plain strings.
+export const CURRENCY_OPTIONS = ["USD", "EUR", "GBP"] as const;

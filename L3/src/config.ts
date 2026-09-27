@@ -12,10 +12,9 @@ export const config = {
   l2Url: process.env.L2_URL ?? 'http://127.0.0.1:3001',
   storagePath: process.env.L3_STORAGE_PATH
     ?? resolve(__dirname, '..', '.data', 'ipfs'),
-  // L3's own (txId, dataType) -> CID index — L2 no longer tracks this;
-  // L3 is self-contained for resolving its own data. Sits alongside
-  // storagePath under .data/, so dev-up.sh's existing `rm -rf L3/.data`
-  // wipe (done for an unrelated libp2p reason) clears this too.
+  // L3's own (txId, dataType) -> CID index. Sits alongside storagePath
+  // under .data/, so dev-up.sh's `rm -rf L3/.data` wipe (done for an
+  // unrelated libp2p reason) clears this too.
   cidDbPath: process.env.L3_CID_DB_PATH
     ?? resolve(__dirname, '..', '.data', 'cids.db'),
   // Shared secret gating every route but /health — L3's stand-in for real

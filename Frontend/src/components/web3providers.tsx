@@ -52,6 +52,36 @@ function L2EventListener({ children }: { children: React.ReactNode }) {
       }
     });
 
+    source.addEventListener('USER_REJECTED', (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+
+        toast.error("Your registration was rejected — any submitted data has been erased.", {
+          duration: 10000,
+        });
+
+        const event = new CustomEvent('L2_USER_REJECTED', { detail: payload });
+        window.dispatchEvent(event);
+      } catch (err) {
+        console.error('[L2 SSE] Error parsing USER_REJECTED data', err);
+      }
+    });
+
+    source.addEventListener('ASSET_REJECTED', (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+
+        toast.error(`Asset #${payload.assetId} was rejected — its stored metadata has been erased.`, {
+          duration: 10000,
+        });
+
+        const event = new CustomEvent('L2_ASSET_REJECTED', { detail: payload });
+        window.dispatchEvent(event);
+      } catch (err) {
+        console.error('[L2 SSE] Error parsing ASSET_REJECTED data', err);
+      }
+    });
+
     source.onerror = () => {
       console.warn('[L2 SSE] Connection error. Retrying...');
     };

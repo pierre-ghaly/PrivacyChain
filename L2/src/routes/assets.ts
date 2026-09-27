@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { config } from '../config';
 import type { KeyStore } from '../keyStore';
-import { getAssetDetailL1, getAllAssetsDetailL1, isAdminL1, type L1AssetDetail } from '../l1Client';
+import { getAssetDetailL1, getAllAssetsDetailL1, isAdminL1, isAssetPubliclyVisibleL1, type L1AssetDetail } from '../l1Client';
 import { requireAuth } from '../auth';
 
 // Fetches and decrypts ASSET_METADATA from L3 for a given txId. L3 resolves
@@ -42,18 +42,13 @@ async function buildFullAsset(
 
   return {
     // --- L1: public, immutable ---
-    id:         l1.id.toString(),
-    name:       l1.name,
-    status:     l1.status === 0 ? 'PENDING' : 'ACTIVE',
-    createdAt:  l1.createdAt.toString(),
-    exists:     l1.exists,
-    owner:      l1.owner,
-    valuations: l1.valuations.map(v => ({
-      certifier:    v.certifier,
-      value:        v.value.toString(),
-      currencyCode: v.currencyCode,
-      certifiedAt:  v.certifiedAt.toString(),
-    })),
+    id:        l1.id.toString(),
+    name:      l1.name,
+    status:    l1.status === 0 ? 'PENDING' : l1.status === 1 ? 'ACTIVE' : 'REJECTED',
+    createdAt: l1.createdAt.toString(),
+    exists:    l1.exists,
+    owner:     l1.owner,
+    isPublic:  l1.isPublic,
     // --- L3: encrypted, erasable ---
     metadata: erased
       ? { erased: true, note: 'Cryptographic erasure complete — RTBF exit processed.' }
@@ -68,13 +63,16 @@ export function assetsRouter(keyStore: KeyStore): Router {
   const router = Router();
 
   // GET /assets/:assetId
-  // Returns the full asset object: L1 fields + valuations + decrypted L3 metadata.
-  // Gated: the asset's own owner or an admin — this returns decrypted L3
-  // content, not just the public L1 fields.
-  router.get('/:assetId', requireAuth, async (req, res) => {
+  // Returns the full asset object: L1 fields + decrypted L3 metadata.
+  // requireAuth is NOT blanket middleware here (unlike every other L2 route)
+  // — a publicly-visible asset (isAssetPubliclyVisibleL1, the same AND-logic
+  // check the contract itself exposes) is served to anyone, including a
+  // fully disconnected caller with no signed session at all. Anything not
+  // publicly visible falls through to the normal signed owner-or-admin check.
+  router.get('/:assetId', async (req, res) => {
     // req.params is over-broadly typed as string | string[] once a
-    // middleware arg (requireAuth) is added before the handler — a
-    // @types/express v5 vs express v4 mismatch, not a real runtime concern.
+    // middleware arg is added before the handler — a @types/express v5 vs
+    // express v4 mismatch, not a real runtime concern.
     const { assetId } = req.params as { assetId: string };
 
     let l1: L1AssetDetail;
@@ -94,14 +92,22 @@ export function assetsRouter(keyStore: KeyStore): Router {
       return;
     }
 
-    const isOwner = l1.owner.toLowerCase() === req.authAddress;
-    if (!isOwner && !(await isAdminL1(req.authAddress!))) {
-      res.status(403).json({ error: 'Not authorized to view this asset.' });
+    if (await isAssetPubliclyVisibleL1(assetId)) {
+      const asset = await buildFullAsset(l1, keyStore);
+      res.json({ ok: true, asset });
       return;
     }
 
-    const asset = await buildFullAsset(l1, keyStore);
-    res.json({ ok: true, asset });
+    requireAuth(req, res, async () => {
+      const isOwner = l1.owner.toLowerCase() === req.authAddress;
+      if (!isOwner && !(await isAdminL1(req.authAddress!))) {
+        res.status(403).json({ error: 'Not authorized to view this asset.' });
+        return;
+      }
+
+      const asset = await buildFullAsset(l1, keyStore);
+      res.json({ ok: true, asset });
+    });
   });
 
   // GET /assets

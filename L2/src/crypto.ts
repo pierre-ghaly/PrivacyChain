@@ -63,11 +63,18 @@ export function decryptBuffer(encryptedJson: string, key: Buffer): Buffer {
 }
 
 // SHA-256 commitment: proofHash = SHA-256(user || sorted(txIds).join(',') || timestamp)
+// txIds are numeric strings — sort by numeric value, not lexicographically
+// (a plain .sort() would put "24" before "4"), so the formula is reproducible
+// by anyone re-deriving it from the on-chain txId list.
 export function computeErasureProofHash(
   user: string,
   txIds: string[],
   timestamp: number,
 ): Buffer {
-  const input = `${user.toLowerCase()}|${[...txIds].sort().join(',')}|${timestamp}`;
+  const sortedTxIds = [...txIds].sort((a, b) => {
+    const diff = BigInt(a) - BigInt(b);
+    return diff < 0n ? -1 : diff > 0n ? 1 : 0;
+  });
+  const input = `${user.toLowerCase()}|${sortedTxIds.join(',')}|${timestamp}`;
   return createHash('sha256').update(input, 'utf8').digest();
 }

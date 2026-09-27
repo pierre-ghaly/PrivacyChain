@@ -7,24 +7,18 @@ export function imagesRouter(): Router {
   const router = Router();
 
   // POST /images
-  // Encrypts a binary image under the asset's Kr and pins it to Helia IPFS.
-  // The returned CID should be added to the asset's ASSET_METADATA imageCids list.
+  // Encrypts a binary image under the asset's Kr (same key as ASSET_METADATA)
+  // and pins it to Helia IPFS. The returned CID should be added to the
+  // asset's ASSET_METADATA imageCids list by the caller.
   //
   // Body:
   //   txId      — the asset creation transactionId (used to look up Kr in L2)
   //   imageData — base64-encoded image bytes
   //   mimeType  — optional MIME type hint (e.g. "image/jpeg"), stored alongside the data
   //
-  // Flow:
-  //   1. Decode base64 imageData to Buffer
-  //   2. Fetch Kr from L2 using txId (same key used for ASSET_METADATA)
-  //   3. Encrypt image bytes with AES-256-GCM using Kr
-  //   4. Pin encrypted blob to Helia → get CID
-  //   5. Return CID to caller — add it to imageCids in ASSET_METADATA
-  //
-  // Images are NOT registered in L2's CID index; they are referenced only
-  // within the encrypted ASSET_METADATA blob.  On RTBF exit, the shared Kr
-  // is destroyed so all images become inaccessible alongside the metadata.
+  // Images aren't registered in L3's CID index — they're referenced only
+  // from within the encrypted ASSET_METADATA blob, so destroying the shared
+  // Kr on RTBF exit makes them inaccessible alongside the metadata too.
   router.post('/', async (req, res) => {
     const { txId, imageData, mimeType } = req.body as {
       txId?: string;

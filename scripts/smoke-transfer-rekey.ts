@@ -1,8 +1,8 @@
 /**
- * Smoke test for the transfer re-key + nonce-based erasure fix.
+ * Smoke test for transfer re-keying + nonce-based erasure.
  *
- * Exercises the exact scenario the fix addresses: a creator transfers an
- * asset, then exits — the new owner's data must survive. Run against a
+ * Exercises the scenario where re-keying matters most: a creator transfers
+ * an asset, then exits — the new owner's data must survive. Run against a
  * live `npm run dev` stack:
  *
  *   npx tsx scripts/smoke-transfer-rekey.ts
@@ -184,9 +184,9 @@ async function main() {
 
   console.log('\n== Bob (current owner) sets BURN and exits ==');
   // Bob still owns this asset, so without an explicit BURN policy his default
-  // TRANSFER_TO_SYSTEM would re-key it to systemAddress on exit (correct new
-  // behavior — see scripts/smoke-exit-disposition-rekey.ts) rather than erase
-  // it. BURN is what actually reaches a terminal, no-new-owner erasure here.
+  // TRANSFER_TO_SYSTEM would re-key it to systemAddress on exit (see
+  // scripts/smoke-exit-disposition-rekey.ts) rather than erase it. BURN is
+  // what actually reaches a terminal, no-new-owner erasure here.
   await (await (registry.connect(bob) as any).setInactivePolicy(2, ethers.ZeroAddress)).wait();
   await (await (registry.connect(bob) as any).requestExit()).wait();
   await waitFor('Bob erasure to complete', async () => {

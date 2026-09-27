@@ -28,7 +28,6 @@ export default function TransfersPage() {
       setIsLoading(true);
 
       try {
-        // scan all transfer events from genesis block
         const transferLogs = await publicClient.getContractEvents({
           address: ASSET_REGISTRY_ADDRESS,
           abi: ASSET_REGISTRY_ABI,

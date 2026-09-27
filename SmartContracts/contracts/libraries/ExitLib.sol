@@ -18,6 +18,13 @@ library ExitLib {
         mapping(address => bytes32) erasureProofs;
         mapping(address => uint256) exitTimestamps;
         // ---- append new fields below this line ----
+        // The exact timestamp hashed into erasureProofs[user] by the caller
+        // (L2) — distinct from exitTimestamps (set at requestExit()) and from
+        // block.timestamp at the moment this proof is recorded (a later,
+        // different value). Without storing this, the timestamp component of
+        // the SHA-256 commitment is unrecoverable on-chain, and the proof
+        // can't actually be independently recomputed by a third party.
+        mapping(address => uint256) proofTimestamps;
     }
 
     // -------------------------------------------------------------------------
@@ -31,9 +38,11 @@ library ExitLib {
     function recordProof(
         Store storage s,
         address _user,
-        bytes32 _proofHash
+        bytes32 _proofHash,
+        uint256 _proofTimestamp
     ) internal {
         s.erasureProofs[_user] = _proofHash;
+        s.proofTimestamps[_user] = _proofTimestamp;
     }
 
     // -------------------------------------------------------------------------
@@ -50,6 +59,10 @@ library ExitLib {
 
     function getTimestamp(Store storage s, address _user) internal view returns (uint256) {
         return s.exitTimestamps[_user];
+    }
+
+    function getProofTimestamp(Store storage s, address _user) internal view returns (uint256) {
+        return s.proofTimestamps[_user];
     }
 
     function getStatus(

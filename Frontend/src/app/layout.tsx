@@ -5,7 +5,7 @@ import Navbar from "@/components/navbar";
 import { Toaster } from "sonner";
 
 export const metadata: Metadata = {
-  title: "blockchain.",
+  title: "PrivacyChain",
   description: "User and Admin Dashboard",
 };
 

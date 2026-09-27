@@ -2,7 +2,7 @@ import { defineConfig, devices } from '@playwright/test';
 
 // Reuses scripts/dev-up.sh (the same "one command" used for manual dev) rather
 // than re-encoding the Hardhat -> deploy -> L2 -> L3 -> seed -> Frontend
-// startup order here. See the root README for what that script does.
+// startup order here.
 export default defineConfig({
   testDir: './e2e',
   timeout: 60 * 1000,

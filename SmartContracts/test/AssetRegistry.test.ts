@@ -1,4 +1,5 @@
 import { expect } from "chai";
+import { anyValue } from "@nomicfoundation/hardhat-chai-matchers/withArgs";
 import { ethers, upgrades } from "hardhat";
 import { AssetRegistry } from "../typechain-types";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
@@ -10,9 +11,10 @@ describe("AssetRegistry", function () {
   let system: SignerWithAddress;
   let user1: SignerWithAddress;
   let user2: SignerWithAddress;
+  let user3: SignerWithAddress;
 
   beforeEach(async function () {
-    [owner, admin, system, user1, user2] = await ethers.getSigners();
+    [owner, admin, system, user1, user2, user3] = await ethers.getSigners();
 
     const AssetRegistry = await ethers.getContractFactory("AssetRegistry");
     assetRegistry = (await upgrades.deployProxy(
@@ -160,12 +162,14 @@ describe("AssetRegistry", function () {
       ).to.be.revertedWith("Asset is not active");
     });
 
-    it("should allow adding a valuation to a still-PENDING asset", async function () {
+    it("should mint a txId and emit FinancialAssertionRequested for a still-PENDING asset, with no sensitive content", async function () {
       await assetRegistry.connect(system).createAsset("Unapproved Yacht");
+      const expectedTxId = await assetRegistry.nextTransactionId();
 
       await expect(
-        assetRegistry.connect(admin).addValuation(0, admin.address, 1000n, "0x555344")
-      ).to.emit(assetRegistry, "ValuationAdded");
+        assetRegistry.connect(system).requestFinancialAssertion(0, ethers.ZeroAddress)
+      ).to.emit(assetRegistry, "FinancialAssertionRequested")
+        .withArgs(0n, system.address, ethers.ZeroAddress, expectedTxId);
     });
 
     it("should track multiple assets per user via getUserAssets", async function () {
@@ -405,20 +409,25 @@ describe("AssetRegistry", function () {
 
   describe("Erasure Proof", function () {
     const proofHash = ethers.id("zkp-destruction-proof-001");
+    // Deliberately NOT "now" — distinct from block.timestamp (the moment
+    // recordErasureProof is mined) so a test that conflated the two values
+    // would fail instead of passing by coincidence.
+    const proofTimestamp = 1_700_000_000n;
 
     beforeEach(async function () {
       await giveAssetToUser(user1, "Proof Asset");
       await assetRegistry.connect(user1).requestExit();
     });
 
-    it("should record erasure proof for a deactivated user", async function () {
-      const tx = assetRegistry.connect(owner).recordErasureProof(user1.address, proofHash);
+    it("should record erasure proof (and its exact timestamp) for a deactivated user", async function () {
+      const tx = assetRegistry.connect(owner).recordErasureProof(user1.address, proofHash, proofTimestamp);
 
       await expect(tx)
         .to.emit(assetRegistry, "ErasureProofRecorded")
-        .withArgs(user1.address, proofHash, await getBlockTimestamp(tx));
+        .withArgs(user1.address, proofHash, proofTimestamp);
 
       expect(await assetRegistry.getErasureProof(user1.address)).to.equal(proofHash);
+      expect(await assetRegistry.getErasureProofTimestamp(user1.address)).to.equal(proofTimestamp);
 
       const status = await assetRegistry.getExitStatus(user1.address);
       expect(status.hasErasureProof).to.be.true;
@@ -428,21 +437,27 @@ describe("AssetRegistry", function () {
       await assetRegistry.connect(user2).registerUser();
       await assetRegistry.connect(admin).approveUser(user2.address);
       await expect(
-        assetRegistry.connect(owner).recordErasureProof(user2.address, proofHash)
+        assetRegistry.connect(owner).recordErasureProof(user2.address, proofHash, proofTimestamp)
       ).to.be.revertedWith("User must be deactivated before proof recording");
     });
 
     it("should reject duplicate proof recording", async function () {
-      await assetRegistry.connect(owner).recordErasureProof(user1.address, proofHash);
+      await assetRegistry.connect(owner).recordErasureProof(user1.address, proofHash, proofTimestamp);
       await expect(
-        assetRegistry.connect(owner).recordErasureProof(user1.address, proofHash)
+        assetRegistry.connect(owner).recordErasureProof(user1.address, proofHash, proofTimestamp)
       ).to.be.revertedWith("Erasure proof already recorded");
     });
 
     it("should reject zero proof hash", async function () {
       await expect(
-        assetRegistry.connect(owner).recordErasureProof(user1.address, ethers.ZeroHash)
+        assetRegistry.connect(owner).recordErasureProof(user1.address, ethers.ZeroHash, proofTimestamp)
       ).to.be.revertedWith("Proof hash cannot be zero");
+    });
+
+    it("should reject zero proof timestamp", async function () {
+      await expect(
+        assetRegistry.connect(owner).recordErasureProof(user1.address, proofHash, 0n)
+      ).to.be.revertedWith("Proof timestamp cannot be zero");
     });
   });
 
@@ -549,6 +564,370 @@ describe("AssetRegistry", function () {
 
       const profile = await assetRegistry.users(user1.address);
       expect(profile.isActive).to.be.false;
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Rejection
+  // ---------------------------------------------------------------------------
+
+  describe("Rejection", function () {
+    describe("User rejection", function () {
+      beforeEach(async function () {
+        await assetRegistry.connect(user1).registerUser();
+      });
+
+      it("should reject a pending user and mark them permanently rejected", async function () {
+        const tx = assetRegistry.connect(admin).rejectUser(user1.address);
+        await expect(tx)
+          .to.emit(assetRegistry, "UserRejected")
+          .withArgs(user1.address, await getBlockTimestamp(tx));
+
+        const profile = await assetRegistry.users(user1.address);
+        expect(profile.isRejected).to.be.true;
+      });
+
+      it("should prevent approving a rejected user", async function () {
+        await assetRegistry.connect(admin).rejectUser(user1.address);
+        await expect(
+          assetRegistry.connect(admin).approveUser(user1.address)
+        ).to.be.revertedWith("User has been rejected");
+      });
+
+      it("should prevent re-registering after rejection", async function () {
+        await assetRegistry.connect(admin).rejectUser(user1.address);
+        await expect(
+          assetRegistry.connect(user1).registerUser()
+        ).to.be.revertedWith("User already registered");
+      });
+
+      it("should prevent rejecting an already-active user", async function () {
+        await assetRegistry.connect(admin).approveUser(user1.address);
+        await expect(
+          assetRegistry.connect(admin).rejectUser(user1.address)
+        ).to.be.revertedWith("User already active");
+      });
+
+      it("should prevent double rejection", async function () {
+        await assetRegistry.connect(admin).rejectUser(user1.address);
+        await expect(
+          assetRegistry.connect(admin).rejectUser(user1.address)
+        ).to.be.revertedWith("User already rejected");
+      });
+
+      it("should prevent rejecting an already-exited user (disambiguating from never-approved)", async function () {
+        await assetRegistry.connect(admin).approveUser(user1.address);
+        await assetRegistry.connect(user1).requestExit();
+        await expect(
+          assetRegistry.connect(admin).rejectUser(user1.address)
+        ).to.be.revertedWith("User has already exited");
+      });
+    });
+
+    describe("Asset rejection", function () {
+      it("should reject a pending asset and emit AssetRejected", async function () {
+        await assetRegistry.connect(system).createAsset("Unwanted Item");
+        const tx = assetRegistry.connect(admin).rejectAsset(0);
+        await expect(tx)
+          .to.emit(assetRegistry, "AssetRejected")
+          .withArgs(0n, system.address, await getBlockTimestamp(tx));
+
+        const asset = await assetRegistry.assets(0);
+        expect(asset.status).to.equal(2n); // REJECTED
+      });
+
+      it("should prevent approving a rejected asset", async function () {
+        await assetRegistry.connect(system).createAsset("Unwanted Item");
+        await assetRegistry.connect(admin).rejectAsset(0);
+        await expect(
+          assetRegistry.connect(admin).approveAsset(0)
+        ).to.be.revertedWith("Asset is not pending");
+      });
+
+      it("should prevent transferring a rejected asset", async function () {
+        await assetRegistry.connect(system).createAsset("Unwanted Item");
+        await assetRegistry.connect(admin).rejectAsset(0);
+        await assetRegistry.connect(user1).registerUser();
+        await assetRegistry.connect(admin).approveUser(user1.address);
+        await expect(
+          assetRegistry.connect(system).transferAsset(0, user1.address)
+        ).to.be.revertedWith("Asset is not active");
+      });
+
+      it("should prevent double rejection", async function () {
+        await assetRegistry.connect(system).createAsset("Unwanted Item");
+        await assetRegistry.connect(admin).rejectAsset(0);
+        await expect(
+          assetRegistry.connect(admin).rejectAsset(0)
+        ).to.be.revertedWith("Asset is not pending");
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Financial Assertions
+  // ---------------------------------------------------------------------------
+
+  describe("Financial Assertions", function () {
+    it("should let the owner request a solo valuation assertion", async function () {
+      const assetId = await giveAssetToUser(user1, "Painting");
+      const expectedTxId = await assetRegistry.nextTransactionId();
+
+      await expect(
+        assetRegistry.connect(user1).requestFinancialAssertion(assetId, ethers.ZeroAddress)
+      ).to.emit(assetRegistry, "FinancialAssertionRequested")
+        .withArgs(assetId, user1.address, ethers.ZeroAddress, expectedTxId);
+    });
+
+    it("should let the seller request a sale-price assertion naming a counterparty", async function () {
+      const assetId = await giveAssetToUser(user1, "Car");
+      await assetRegistry.connect(user2).registerUser();
+      await assetRegistry.connect(admin).approveUser(user2.address);
+      const expectedTxId = await assetRegistry.nextTransactionId();
+
+      await expect(
+        assetRegistry.connect(user1).requestFinancialAssertion(assetId, user2.address)
+      ).to.emit(assetRegistry, "FinancialAssertionRequested")
+        .withArgs(assetId, user1.address, user2.address, expectedTxId);
+    });
+
+    it("should prevent a non-owner, non-admin from requesting an assertion", async function () {
+      const assetId = await giveAssetToUser(user1, "Car");
+      await assetRegistry.connect(user2).registerUser();
+      await assetRegistry.connect(admin).approveUser(user2.address);
+      await expect(
+        assetRegistry.connect(user2).requestFinancialAssertion(assetId, ethers.ZeroAddress)
+      ).to.be.revertedWith("Not authorized to submit a financial assertion");
+    });
+
+    it("should prevent naming yourself as the counterparty", async function () {
+      const assetId = await giveAssetToUser(user1, "Car");
+      await expect(
+        assetRegistry.connect(user1).requestFinancialAssertion(assetId, user1.address)
+      ).to.be.revertedWith("Counterparty cannot be yourself");
+    });
+
+    it("should prevent naming an unregistered counterparty", async function () {
+      const assetId = await giveAssetToUser(user1, "Car");
+      await expect(
+        assetRegistry.connect(user1).requestFinancialAssertion(assetId, user2.address)
+      ).to.be.revertedWith("Counterparty must be a registered, active user");
+    });
+
+    it("should let admin decide an assertion on-chain, carrying no sensitive content", async function () {
+      const assetId = await giveAssetToUser(user1, "Painting");
+      const expectedTxId = await assetRegistry.nextTransactionId();
+      await assetRegistry.connect(user1).requestFinancialAssertion(assetId, ethers.ZeroAddress);
+
+      const tx = assetRegistry.connect(admin).decideFinancialAssertion(expectedTxId, true);
+      await expect(tx)
+        .to.emit(assetRegistry, "FinancialAssertionDecided")
+        .withArgs(expectedTxId, true, admin.address, await getBlockTimestamp(tx));
+    });
+
+    it("should prevent a non-admin from deciding an assertion", async function () {
+      const assetId = await giveAssetToUser(user1, "Painting");
+      const expectedTxId = await assetRegistry.nextTransactionId();
+      await assetRegistry.connect(user1).requestFinancialAssertion(assetId, ethers.ZeroAddress);
+
+      await expect(
+        assetRegistry.connect(user1).decideFinancialAssertion(expectedTxId, true)
+      ).to.be.revertedWithCustomError(assetRegistry, "AccessControlUnauthorizedAccount");
+    });
+
+    it("should let admin decide a nonexistent assertion revert", async function () {
+      await expect(
+        assetRegistry.connect(admin).decideFinancialAssertion(9999, true)
+      ).to.be.revertedWith("Assertion does not exist");
+    });
+
+    it("should prevent deciding the same assertion twice", async function () {
+      const assetId = await giveAssetToUser(user1, "Painting");
+      const txId = await assetRegistry.nextTransactionId();
+      await assetRegistry.connect(user1).requestFinancialAssertion(assetId, ethers.ZeroAddress);
+      await assetRegistry.connect(admin).decideFinancialAssertion(txId, true);
+
+      await expect(
+        assetRegistry.connect(admin).decideFinancialAssertion(txId, true)
+      ).to.be.revertedWith("Assertion already decided");
+      await expect(
+        assetRegistry.connect(admin).decideFinancialAssertion(txId, false)
+      ).to.be.revertedWith("Assertion already decided");
+    });
+
+    describe("Both-party confirmation gate (sale-price only)", function () {
+      async function setUpSalePrice() {
+        const assetId = await giveAssetToUser(user1, "Car");
+        await assetRegistry.connect(user2).registerUser();
+        await assetRegistry.connect(admin).approveUser(user2.address);
+        const txId = await assetRegistry.nextTransactionId();
+        await assetRegistry.connect(user1).requestFinancialAssertion(assetId, user2.address);
+        return txId;
+      }
+
+      it("should prevent admin from approving a sale-price assertion before either side confirms", async function () {
+        const txId = await setUpSalePrice();
+        await expect(
+          assetRegistry.connect(admin).decideFinancialAssertion(txId, true)
+        ).to.be.revertedWith("Both parties must confirm before approval");
+      });
+
+      it("should prevent admin from approving after only the seller confirms", async function () {
+        const txId = await setUpSalePrice();
+        await assetRegistry.connect(user1).confirmFinancialAssertion(txId);
+        await expect(
+          assetRegistry.connect(admin).decideFinancialAssertion(txId, true)
+        ).to.be.revertedWith("Both parties must confirm before approval");
+      });
+
+      it("should prevent admin from approving after only the buyer confirms", async function () {
+        const txId = await setUpSalePrice();
+        await assetRegistry.connect(user2).confirmFinancialAssertion(txId);
+        await expect(
+          assetRegistry.connect(admin).decideFinancialAssertion(txId, true)
+        ).to.be.revertedWith("Both parties must confirm before approval");
+      });
+
+      it("should let admin approve once both seller and buyer have confirmed", async function () {
+        const txId = await setUpSalePrice();
+        await expect(assetRegistry.connect(user1).confirmFinancialAssertion(txId))
+          .to.emit(assetRegistry, "FinancialAssertionConfirmed")
+          .withArgs(txId, user1.address, false, anyValue);
+        await expect(assetRegistry.connect(user2).confirmFinancialAssertion(txId))
+          .to.emit(assetRegistry, "FinancialAssertionConfirmed")
+          .withArgs(txId, user2.address, true, anyValue);
+
+        const tx = assetRegistry.connect(admin).decideFinancialAssertion(txId, true);
+        await expect(tx)
+          .to.emit(assetRegistry, "FinancialAssertionDecided")
+          .withArgs(txId, true, admin.address, await getBlockTimestamp(tx));
+      });
+
+      it("should never require confirmation to reject, even with neither side confirmed", async function () {
+        const txId = await setUpSalePrice();
+        const tx = assetRegistry.connect(admin).decideFinancialAssertion(txId, false);
+        await expect(tx)
+          .to.emit(assetRegistry, "FinancialAssertionDecided")
+          .withArgs(txId, false, admin.address, await getBlockTimestamp(tx));
+      });
+
+      it("should not require any confirmation for a solo valuation (no counterparty)", async function () {
+        const assetId = await giveAssetToUser(user1, "Painting");
+        const txId = await assetRegistry.nextTransactionId();
+        await assetRegistry.connect(user1).requestFinancialAssertion(assetId, ethers.ZeroAddress);
+
+        // No confirmFinancialAssertion call at all — should still succeed.
+        await expect(
+          assetRegistry.connect(admin).decideFinancialAssertion(txId, true)
+        ).to.emit(assetRegistry, "FinancialAssertionDecided");
+      });
+
+      it("should prevent a party from confirming a nonexistent assertion", async function () {
+        await expect(
+          assetRegistry.connect(user1).confirmFinancialAssertion(9999)
+        ).to.be.revertedWith("Assertion does not exist");
+      });
+
+      it("should prevent someone who is neither the seller nor the buyer from confirming", async function () {
+        const txId = await setUpSalePrice();
+        await assetRegistry.connect(user3).registerUser();
+        await assetRegistry.connect(admin).approveUser(user3.address);
+        await expect(
+          assetRegistry.connect(user3).confirmFinancialAssertion(txId)
+        ).to.be.revertedWith("Not a party to this assertion");
+      });
+
+      it("should expose confirmation status via getFinancialAssertionStatus", async function () {
+        const txId = await setUpSalePrice();
+        await assetRegistry.connect(user1).confirmFinancialAssertion(txId);
+
+        const status = await assetRegistry.getFinancialAssertionStatus(txId);
+        expect(status.submittedBy).to.equal(user1.address);
+        expect(status.counterparty).to.equal(user2.address);
+        expect(status.sellerConfirmed).to.equal(true);
+        expect(status.buyerConfirmed).to.equal(false);
+        expect(status.readyForApproval).to.equal(false);
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Explorer Visibility
+  // ---------------------------------------------------------------------------
+
+  describe("Explorer Visibility", function () {
+    it("should default new assets to private", async function () {
+      const assetId = await giveAssetToUser(user1, "Painting");
+      const detail = await assetRegistry.getAssetDetail(assetId);
+      expect(detail.isPublic).to.be.false;
+    });
+
+    it("should let the owner make their own asset public", async function () {
+      const assetId = await giveAssetToUser(user1, "Painting");
+      await expect(assetRegistry.connect(user1).setAssetVisibility(assetId, true))
+        .to.emit(assetRegistry, "AssetVisibilityUpdated")
+        .withArgs(assetId, true);
+
+      const detail = await assetRegistry.getAssetDetail(assetId);
+      expect(detail.isPublic).to.be.true;
+    });
+
+    it("should prevent admin from changing another user's asset visibility", async function () {
+      const assetId = await giveAssetToUser(user1, "Painting");
+      await expect(
+        assetRegistry.connect(admin).setAssetVisibility(assetId, true)
+      ).to.be.revertedWith("You do not own this asset");
+    });
+
+    it("should prevent a non-owner from changing asset visibility", async function () {
+      const assetId = await giveAssetToUser(user1, "Painting");
+      await expect(
+        assetRegistry.connect(user2).setAssetVisibility(assetId, true)
+      ).to.be.revertedWith("You do not own this asset");
+    });
+
+    it("should apply the platform default to new assets going forward, without touching existing ones", async function () {
+      const existingAssetId = await giveAssetToUser(user1, "Old Painting");
+      await assetRegistry.connect(admin).setDefaultAssetVisibility(true);
+      const newAssetId = await giveAssetToUser(user1, "New Painting");
+
+      expect((await assetRegistry.getAssetDetail(existingAssetId)).isPublic).to.be.false;
+      expect((await assetRegistry.getAssetDetail(newAssetId)).isPublic).to.be.true;
+    });
+
+    it("should prevent a non-admin from setting the platform default", async function () {
+      await expect(
+        assetRegistry.connect(user1).setDefaultAssetVisibility(true)
+      ).to.be.revertedWithCustomError(assetRegistry, "AccessControlUnauthorizedAccount");
+    });
+
+    describe("getPublicAssetsDetail / isAssetPubliclyVisible", function () {
+      it("should return nothing while explorerAccessMode is REGISTERED_ONLY, even for a public asset", async function () {
+        const assetId = await giveAssetToUser(user1, "Painting");
+        await assetRegistry.connect(user1).setAssetVisibility(assetId, true);
+        expect(await assetRegistry.isAssetPubliclyVisible(assetId)).to.be.false;
+        expect((await assetRegistry.getPublicAssetsDetail()).length).to.equal(0);
+      });
+
+      it("should require both the asset's own flag and the owner's assetsPublic flag (AND logic)", async function () {
+        const assetId = await giveAssetToUser(user1, "Painting");
+        await assetRegistry.connect(admin).setExplorerAccessMode(1); // PUBLIC
+
+        // asset private (default), owner assetsPublic true (default) -> not visible
+        expect(await assetRegistry.isAssetPubliclyVisible(assetId)).to.be.false;
+
+        // owner makes the asset itself public -> both true now -> visible
+        await assetRegistry.connect(user1).setAssetVisibility(assetId, true);
+        expect(await assetRegistry.isAssetPubliclyVisible(assetId)).to.be.true;
+
+        const publicAssets = await assetRegistry.getPublicAssetsDetail();
+        expect(publicAssets.length).to.equal(1);
+        expect(publicAssets[0].id).to.equal(assetId);
+
+        // owner opts their whole account out -> asset still flagged public but no longer visible
+        await assetRegistry.connect(user1).setVisibility(false, true);
+        expect(await assetRegistry.isAssetPubliclyVisible(assetId)).to.be.false;
+      });
     });
   });
 

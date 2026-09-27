@@ -5,6 +5,7 @@ import { statusRouter } from './routes/status';
 import { assetsRouter } from './routes/assets';
 import { authRouter } from './routes/auth';
 import { l3ProxyRouter } from './routes/l3proxy';
+import { assertionsRouter } from './routes/assertions';
 import type { KeyStore } from './keyStore';
 
 export function createServer(keyStore: KeyStore): express.Application {
@@ -30,6 +31,7 @@ export function createServer(keyStore: KeyStore): express.Application {
   app.use('/assets', assetsRouter(keyStore));
   app.use('/auth', authRouter());
   app.use('/l3', l3ProxyRouter(keyStore));
+  app.use('/assertions', assertionsRouter(keyStore));
 
   return app;
 }

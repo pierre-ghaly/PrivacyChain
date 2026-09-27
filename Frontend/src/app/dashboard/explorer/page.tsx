@@ -1,8 +1,8 @@
 'use client';
 import { Card } from "@/components/card";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useReadContract, useWriteContract, usePublicClient, useAccount, useSignMessage } from "wagmi";
-import { keccak256, toHex, isAddress } from "viem";
+import { keccak256, toHex } from "viem";
 import { toast } from "sonner";
 import { ASSET_REGISTRY_ADDRESS, ASSET_REGISTRY_ABI, L2_SERVER_URL, CURRENCY_OPTIONS } from "@/contracts";
 import { getAuthHeader } from "@/lib/l2Auth";
@@ -16,7 +16,7 @@ interface GlobalAsset {
   owner: string;
   status: string;
   createdAt: bigint;
-  valuations: any[];
+  isPublic: boolean;
 }
 
 interface AssetHistoryEvent {
@@ -28,6 +28,8 @@ interface AssetHistoryEvent {
   txHash: string;
   keyDestroyed: boolean;
 }
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
 export default function GlobalExplorerPage() {
   const publicClient = usePublicClient();
@@ -53,9 +55,9 @@ export default function GlobalExplorerPage() {
   const [imageDataUrls, setImageDataUrls] = useState<Record<string, string>>({});
 
   const [isAddingValuation, setIsAddingValuation] = useState(false);
-  const [valuationCertifier, setValuationCertifier] = useState("");
+  const [valuationEntity, setValuationEntity] = useState("");
   const [valuationValue, setValuationValue] = useState("");
-  const [valuationCurrency, setValuationCurrency] = useState<typeof CURRENCY_OPTIONS[number]["code"]>("USD");
+  const [valuationCurrency, setValuationCurrency] = useState<typeof CURRENCY_OPTIONS[number]>("USD");
   const [isSubmittingValuation, setIsSubmittingValuation] = useState(false);
 
   // admin role check via hasRole — no owner() call, contract uses AccessControl
@@ -69,7 +71,19 @@ export default function GlobalExplorerPage() {
 
   const isAdmin = mounted && isConnected && !!userWalletAddress && !!isAdminRole;
 
-  // single call returns all asset details — replaces N+1 loop
+  // Admin's own view always bypasses the visibility filter (unchanged
+  // behaviour); a non-admin visitor's access depends entirely on this mode —
+  // works even fully disconnected, since it's a plain public contract read.
+  const { data: explorerAccessModeData } = useReadContract({
+    address: ASSET_REGISTRY_ADDRESS,
+    abi: ASSET_REGISTRY_ABI,
+    functionName: 'explorerAccessMode',
+    query: { enabled: mounted },
+  });
+  const isExplorerPublic = Number(explorerAccessModeData ?? 0) === 1; // 1 = PUBLIC
+  const canBrowse = isAdmin || isExplorerPublic;
+
+  // single call returns all asset details — replaces N+1 loop. Admin-only on-chain.
   const { data: allAssetsData } = useReadContract({
     address: ASSET_REGISTRY_ADDRESS,
     abi: ASSET_REGISTRY_ABI,
@@ -78,28 +92,44 @@ export default function GlobalExplorerPage() {
     query: { enabled: !!isAdmin },
   });
 
+  // Non-admin path — only ever returns assets that are actually publicly
+  // visible (the contract's own AND-logic check), so this works correctly
+  // even for a fully anonymous, disconnected caller.
+  const { data: publicAssetsData } = useReadContract({
+    address: ASSET_REGISTRY_ADDRESS,
+    abi: ASSET_REGISTRY_ABI,
+    functionName: 'getPublicAssetsDetail',
+    query: { enabled: mounted && !isAdmin && isExplorerPublic },
+  });
+
   useEffect(() => {
     setCurrentPage(1);
   }, [search]);
 
   useEffect(() => {
-    if (!allAssetsData || !isAdmin) return;
-    const assets = (allAssetsData as any[]).map((detail: any) => ({
+    const source = isAdmin ? allAssetsData : publicAssetsData;
+    if (!source || !canBrowse) return;
+    const assets = (source as any[]).map((detail: any) => ({
       id: `#${String(detail.id).padStart(4, '0')}`,
       rawId: BigInt(detail.id),
       name: detail.name,
       owner: detail.owner,
-      status: Number(detail.status) === 0 ? "Pending" : "Public",
+      // AssetLib.Status: 0 = PENDING, 1 = ACTIVE, 2 = REJECTED — distinct
+      // from isPublic below, which is Explorer visibility, not approval state.
+      status: Number(detail.status) === 0 ? "Pending" : Number(detail.status) === 1 ? "Active" : "Rejected",
       createdAt: BigInt(detail.createdAt),
-      valuations: detail.valuations || [],
+      isPublic: detail.isPublic as boolean,
     }));
     setGlobalAssets(assets);
     setIsLoading(false);
-  }, [allAssetsData, isAdmin]);
+  }, [allAssetsData, publicAssetsData, isAdmin, canBrowse]);
 
-  // fetch on-chain audit history when an asset is selected
+  // fetch on-chain audit history when an asset is selected — getAssetHistory
+  // has no role restriction on-chain (ownership history is always public,
+  // same as everything else on L1), so this works for any browsing viewer,
+  // including a fully anonymous one, not just admin.
   useEffect(() => {
-    if (!selectedAsset || !publicClient || !isAdmin) return;
+    if (!selectedAsset || !publicClient || !canBrowse) return;
     setIsLoadingHistory(true);
 
     const fetchHistory = async () => {
@@ -146,26 +176,48 @@ export default function GlobalExplorerPage() {
     fetchHistory();
   }, [selectedAsset?.rawId, publicClient, isAdmin]);
 
-  // Fetches L2's aggregated view (L1 fields + L3-decrypted metadata) for one
-  // asset. Extracted so it can be re-run after adding a valuation, not just
-  // on initial selection.
-  const fetchL2Detail = useCallback(async (assetId: bigint) => {
-    if (!userWalletAddress) return;
-    try {
-      const authHeader = await getAuthHeader(userWalletAddress, signMessageAsync);
-      const res = await fetch(`${L2_SERVER_URL}/assets/${assetId}`, {
-        headers: { 'Authorization': authHeader },
-      });
-      if (res.ok) {
-        const { asset } = await res.json();
-        setL2AssetDetail(asset);
+  // Distinct from `l2AssetDetail` itself so the panel can tell "still
+  // awaiting your signature" apart from "signed but nothing came back" —
+  // both used to render as an empty gap with no explanation, which reads to
+  // a viewer as "there is no L3 data" rather than "this is still pending."
+  const [l2DetailStatus, setL2DetailStatus] = useState<'loading' | 'ready' | 'auth_declined' | 'error'>('loading');
 
+  // Fetches L2's aggregated view (L1 fields + L3-decrypted metadata) for one
+  // asset. Non-admin viewers only ever have publicly-visible assets in their
+  // listing (getPublicAssetsDetail), and L2's GET /assets/:assetId has its
+  // own public bypass for exactly those — so a non-admin (including a fully
+  // anonymous, disconnected) viewer skips signing entirely. Admin still
+  // signs, since admin's listing includes private assets too.
+  const fetchL2Detail = useCallback(async (assetId: bigint) => {
+    let headers: Record<string, string> = {};
+    if (isAdmin) {
+      if (!userWalletAddress) return;
+      try {
+        const authHeader = await getAuthHeader(userWalletAddress, signMessageAsync);
+        headers = { 'Authorization': authHeader };
+      } catch {
+        setL2DetailStatus('auth_declined');
+        return;
+      }
+    }
+    try {
+      const res = await fetch(`${L2_SERVER_URL}/assets/${assetId}`, { headers });
+      if (!res.ok) {
+        setL2DetailStatus('error');
+        return;
+      }
+      const { asset } = await res.json();
+      setL2AssetDetail(asset);
+      setL2DetailStatus('ready');
+
+      // Image retrieval stays owner-or-admin only on L2 (no public bypass
+      // there) — non-admin public browsing shows text metadata only, images
+      // are skipped rather than expanding that route's auth model.
+      if (isAdmin) {
         const imageCids: string[] = asset.metadata?.imageCids ?? [];
         const entries: Array<[string, string] | null> = await Promise.all(imageCids.map(async (cid: string) => {
           try {
-            const imgRes = await fetch(`${L2_SERVER_URL}/l3/retrieve/${cid}?txId=${asset.txId}`, {
-              headers: { 'Authorization': authHeader },
-            });
+            const imgRes = await fetch(`${L2_SERVER_URL}/l3/retrieve/${cid}?txId=${asset.txId}`, { headers });
             if (!imgRes.ok) return null; // erased or not found — skip silently
             const { data } = await imgRes.json();
             const dataUrl: string = `data:${data.mimeType};base64,${data.data}`;
@@ -178,28 +230,60 @@ export default function GlobalExplorerPage() {
         setImageDataUrls(Object.fromEntries(validEntries));
       }
     } catch {
-      // L2 offline, or signature declined — metadata section will not render
+      setL2DetailStatus('error');
     }
-  }, [userWalletAddress, signMessageAsync]);
+  }, [isAdmin, userWalletAddress, signMessageAsync]);
 
   // Kept in its own effect, independent of `publicClient` (a plain REST call,
   // not a contract read) — bundling it with the history effect above meant
   // any `publicClient` reference change (wagmi doesn't guarantee a stable
   // identity across renders) reset this back to null.
   useEffect(() => {
-    if (!selectedAsset || !isAdmin) return;
+    if (!selectedAsset || !canBrowse) return;
     setL2AssetDetail(null);
     setImageDataUrls({});
+    setL2DetailStatus('loading');
     fetchL2Detail(selectedAsset.rawId);
-  }, [selectedAsset?.rawId, isAdmin, fetchL2Detail]);
+  }, [selectedAsset?.rawId, canBrowse, fetchL2Detail]);
 
-  // admin certifies a valuation for any asset, owned or not
+  // Request a solo valuation assertion for any asset, owned or not — admin
+  // qualifies under requestFinancialAssertion's isOwner-or-admin check.
+  // Mints a txId on-chain only; content is POSTed to L3 once KEY_READY fires.
+  const pendingAssertion = useRef<{ assetId: string; data: Record<string, unknown> } | null>(null);
+
+  useEffect(() => {
+    const handleKeyReady = async (e: Event) => {
+      const { detail } = e as CustomEvent<{ txId: string; purpose: string; assetId?: string; user: string }>;
+      const pending = pendingAssertion.current;
+      if (detail.purpose !== 'FINANCIAL_ASSERTION' || !pending) return;
+      if (detail.assetId !== pending.assetId || detail.user.toLowerCase() !== userWalletAddress?.toLowerCase()) return;
+
+      pendingAssertion.current = null;
+      try {
+        const authHeader = await getAuthHeader(detail.user, signMessageAsync);
+        const storeRes = await fetch(`${L2_SERVER_URL}/l3/store`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': authHeader },
+          body: JSON.stringify({ txId: detail.txId, dataType: 'VALUATION', data: pending.data }),
+        });
+        if (!storeRes.ok) throw new Error(`L3 store failed (${storeRes.status})`);
+        toast.success("Valuation submitted — awaiting admin approval.");
+      } catch (err) {
+        console.error(err);
+        toast.error("Assertion requested on-chain, but storing its content on L3 failed.");
+      }
+    };
+
+    window.addEventListener('L2_KEY_READY', handleKeyReady);
+    return () => window.removeEventListener('L2_KEY_READY', handleKeyReady);
+  }, [userWalletAddress, signMessageAsync]);
+
   const handleAddValuation = async () => {
-    if (!selectedAsset) return;
+    if (!selectedAsset || !userWalletAddress) return;
 
-    const certifier = valuationCertifier.trim();
-    if (!isAddress(certifier)) {
-      toast.error("Please enter a valid certifier wallet address");
+    const entity = valuationEntity.trim();
+    if (!entity) {
+      toast.error("Please enter who is asserting this value");
       return;
     }
     const trimmedValue = valuationValue.trim();
@@ -207,25 +291,28 @@ export default function GlobalExplorerPage() {
       toast.error("Please enter a whole number value greater than zero");
       return;
     }
-    const currency = CURRENCY_OPTIONS.find(c => c.code === valuationCurrency)!;
 
     setIsSubmittingValuation(true);
-    const toastId = toast.loading("Anchoring certified valuation on-chain...");
+    const toastId = toast.loading("Requesting financial assertion on-chain...");
     try {
+      pendingAssertion.current = {
+        assetId: selectedAsset.rawId.toString(),
+        data: { value: Number(trimmedValue), currencyCode: valuationCurrency, entity },
+      };
       await writeContractAsync({
         address: ASSET_REGISTRY_ADDRESS,
         abi: ASSET_REGISTRY_ABI,
-        functionName: 'addValuation',
-        args: [selectedAsset.rawId, certifier as `0x${string}`, BigInt(trimmedValue), currency.hex as `0x${string}`],
+        functionName: 'requestFinancialAssertion',
+        args: [selectedAsset.rawId, ZERO_ADDRESS as `0x${string}`],
       });
-      toast.success("Valuation certified and anchored on-chain!", { id: toastId });
+      toast.success("Assertion minted on-chain — encrypting and storing its content off-chain...", { id: toastId });
       setIsAddingValuation(false);
-      setValuationCertifier("");
+      setValuationEntity("");
       setValuationValue("");
       setValuationCurrency("USD");
-      fetchL2Detail(selectedAsset.rawId);
     } catch (error: any) {
-      toast.error(error.shortMessage || "Failed to record valuation.", { id: toastId });
+      pendingAssertion.current = null;
+      toast.error(error.shortMessage || "Failed to request valuation.", { id: toastId });
     } finally {
       setIsSubmittingValuation(false);
     }
@@ -239,7 +326,7 @@ export default function GlobalExplorerPage() {
     );
   }
 
-  if (!isAdmin) {
+  if (!canBrowse) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[70vh] p-8 text-center">
         <div className="w-12 h-12 rounded-full bg-red-50 flex items-center justify-center border border-red-100 text-red-600 mb-4">
@@ -249,8 +336,8 @@ export default function GlobalExplorerPage() {
         </div>
         <h2 className="text-xl font-bold text-black mb-2">Access Restricted</h2>
         <p className="text-sm text-gray-500 max-w-md">
-          The global registry explorer contains restricted transaction audit streams.
-          Access is restricted exclusively to the authorised contract admin.
+          The global registry explorer is currently open to the authorised contract admin only.
+          An admin can open it to everyone via Platform Settings.
         </p>
       </div>
     );
@@ -269,7 +356,9 @@ export default function GlobalExplorerPage() {
     <section className="max-w-7xl mx-auto p-8 relative">
       <div className="mb-8">
         <h1 className="text-4xl font-bold text-black tracking-tight">Global Registry Explorer</h1>
-        <p className="text-gray-500 mt-1">Complete on-chain asset ledger — admin view.</p>
+        <p className="text-gray-500 mt-1">
+          {isAdmin ? "Complete on-chain asset ledger — admin view." : "Publicly visible assets on this registry."}
+        </p>
       </div>
 
       <div className="relative flex items-center mb-8 w-full">
@@ -305,13 +394,22 @@ export default function GlobalExplorerPage() {
                 <div>
                   <div className="flex justify-between items-center mb-2">
                     <span className="text-[10px] font-mono text-gray-400 uppercase">{asset.id}</span>
-                    <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold border ${
-                      asset.status === "Public"
-                        ? "bg-emerald-50 text-emerald-700 border-emerald-200"
-                        : "bg-gray-100 text-gray-600 border-gray-200"
-                    }`}>
-                      {asset.status}
-                    </span>
+                    <div className="flex items-center gap-1">
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold border ${
+                        asset.status === "Active"
+                          ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                          : asset.status === "Rejected"
+                          ? "bg-red-50 text-red-600 border-red-200"
+                          : "bg-gray-100 text-gray-600 border-gray-200"
+                      }`}>
+                        {asset.status}
+                      </span>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold border ${
+                        asset.isPublic ? "bg-blue-50 text-blue-600 border-blue-200" : "bg-gray-50 text-gray-400 border-gray-100"
+                      }`}>
+                        {asset.isPublic ? "Public" : "Private"}
+                      </span>
+                    </div>
                   </div>
                   <h3 className="text-lg font-bold text-black mb-4">{asset.name}</h3>
                 </div>
@@ -371,14 +469,23 @@ export default function GlobalExplorerPage() {
 
             <div className="flex justify-between items-center mb-6">
               <h2 className="text-2xl font-bold text-black">{selectedAsset.name}</h2>
-              <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold border ${
-                selectedAsset.status === "Public"
-                  ? "bg-emerald-50 text-emerald-700 border-emerald-200"
-                  : "bg-gray-100 text-gray-600 border-gray-200"
-              }`}>
-                {selectedAsset.status === "Public" && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />}
-                {selectedAsset.status}
-              </span>
+              <div className="flex items-center gap-1.5">
+                <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold border ${
+                  selectedAsset.status === "Active"
+                    ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                    : selectedAsset.status === "Rejected"
+                    ? "bg-red-50 text-red-600 border-red-200"
+                    : "bg-gray-100 text-gray-600 border-gray-200"
+                }`}>
+                  {selectedAsset.status === "Active" && <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />}
+                  {selectedAsset.status}
+                </span>
+                <span className={`inline-flex items-center px-2 py-1 rounded-full text-[10px] font-semibold border ${
+                  selectedAsset.isPublic ? "bg-blue-50 text-blue-600 border-blue-200" : "bg-gray-50 text-gray-400 border-gray-100"
+                }`}>
+                  {selectedAsset.isPublic ? "Public" : "Private"}
+                </span>
+              </div>
             </div>
 
             {/* stats row */}
@@ -410,7 +517,27 @@ export default function GlobalExplorerPage() {
             </div>
 
             {/* L3 metadata (via L2 aggregation endpoint) */}
-            {l2AssetDetail && (
+            {l2DetailStatus === 'loading' && (
+              <div className="p-3 bg-gray-50 border border-gray-100 rounded-xl mb-4 animate-pulse">
+                <span className="text-[9px] font-bold uppercase text-gray-400 block mb-1">L3 Encrypted Metadata</span>
+                <p className="text-[10px] text-gray-400 italic">Awaiting your signature to decrypt Layer 3 data…</p>
+              </div>
+            )}
+            {l2DetailStatus === 'auth_declined' && (
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl mb-4">
+                <span className="text-[9px] font-bold uppercase text-amber-600 block mb-1">L3 Encrypted Metadata</span>
+                <p className="text-[10px] text-amber-700 leading-relaxed">
+                  Signature declined — sign the authorization prompt to decrypt and view this asset&apos;s Layer 3 data.
+                </p>
+              </div>
+            )}
+            {l2DetailStatus === 'error' && (
+              <div className="p-3 bg-gray-50 border border-gray-100 rounded-xl mb-4">
+                <span className="text-[9px] font-bold uppercase text-gray-400 block mb-1">L3 Encrypted Metadata</span>
+                <p className="text-[10px] text-gray-400 italic">Could not reach Layer 2/3 — try again.</p>
+              </div>
+            )}
+            {l2DetailStatus === 'ready' && l2AssetDetail && (
               <div className="space-y-2 mb-4">
                 {l2AssetDetail.metadata?.erased ? (
                   <div className="p-4 bg-red-50 border border-red-200 rounded-xl">
@@ -466,90 +593,69 @@ export default function GlobalExplorerPage() {
                   </div>
                 )}
 
-                {/* valuations */}
-                {l2AssetDetail.valuations?.length > 0 && (
-                  <div className="p-3 bg-gray-50 border border-gray-100 rounded-xl">
-                    <span className="text-[9px] font-bold uppercase text-gray-400 block mb-2">On-Chain Valuations</span>
-                    <div className="space-y-1.5">
-                      {l2AssetDetail.valuations.map((v: any, i: number) => (
-                        <div key={i} className="flex justify-between items-center bg-white p-2 rounded border border-gray-100">
-                          <div>
-                            <span className="text-[9px] text-gray-400 block">
-                              Certifier: {v.certifier.slice(0, 6)}...{v.certifier.slice(-4)}
-                            </span>
-                            <span className="text-xs font-bold text-black">
-                              {Number(v.value).toLocaleString()} {v.currencyCode}
-                            </span>
-                          </div>
-                          <span className="text-[9px] text-gray-400 font-mono">
-                            {new Date(Number(v.certifiedAt) * 1000).toLocaleDateString("fr-FR")}
-                          </span>
-                        </div>
-                      ))}
+              </div>
+            )}
+
+            {/* Submit a valuation assertion — owner or admin, matching the
+                contract's own requestFinancialAssertion authorization
+                exactly (a random Explorer visitor isn't the owner of
+                someone else's asset, so this isn't over-permissive). Off-chain
+                content, on-chain-minted txId only — see requestFinancialAssertion. */}
+            {(isAdmin || selectedAsset.owner.toLowerCase() === userWalletAddress?.toLowerCase()) && (
+              <div className="p-3 bg-gray-50 border border-gray-100 rounded-xl mb-4">
+                {!isAddingValuation ? (
+                  <button
+                    onClick={() => setIsAddingValuation(true)}
+                    className="w-full text-center text-[11px] font-bold py-1.5 text-gray-600 hover:text-black transition-colors"
+                  >
+                    + Add Valuation
+                  </button>
+                ) : (
+                  <div className="space-y-2">
+                    <span className="text-[9px] font-bold uppercase text-gray-400 block">Submit a Valuation</span>
+                    <input
+                      type="text"
+                      placeholder="Entity (e.g. appraiser or gallery name)"
+                      value={valuationEntity}
+                      onChange={(e) => setValuationEntity(e.target.value)}
+                      className="w-full p-2 bg-white border border-gray-200 rounded-lg text-[11px] focus:outline-none focus:ring-1 focus:ring-black"
+                    />
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        placeholder="Value"
+                        value={valuationValue}
+                        onChange={(e) => setValuationValue(e.target.value)}
+                        className="flex-1 p-2 bg-white border border-gray-200 rounded-lg text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-black"
+                      />
+                      <select
+                        value={valuationCurrency}
+                        onChange={(e) => setValuationCurrency(e.target.value as typeof valuationCurrency)}
+                        className="p-2 bg-white border border-gray-200 rounded-lg text-[11px] font-bold focus:outline-none focus:ring-1 focus:ring-black"
+                      >
+                        {CURRENCY_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
+                      </select>
+                    </div>
+                    <div className="flex gap-2 pt-1">
+                      <button
+                        onClick={() => setIsAddingValuation(false)}
+                        className="flex-1 py-1.5 border border-gray-200 rounded-lg text-[11px] font-bold text-gray-500 hover:bg-gray-100 transition-all"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleAddValuation}
+                        disabled={isSubmittingValuation}
+                        className="flex-1 py-1.5 bg-black text-white rounded-lg text-[11px] font-bold hover:bg-gray-800 disabled:opacity-50 transition-all"
+                      >
+                        Submit
+                      </button>
                     </div>
                   </div>
                 )}
               </div>
             )}
-
-            {/* add valuation — outside the l2AssetDetail gate so it still
-                works if L2's aggregation call is temporarily unreachable */}
-            <div className="p-3 bg-gray-50 border border-gray-100 rounded-xl mb-4">
-              {!isAddingValuation ? (
-                <button
-                  onClick={() => {
-                    setValuationCertifier(userWalletAddress ?? "");
-                    setIsAddingValuation(true);
-                  }}
-                  className="w-full text-center text-[11px] font-bold py-1.5 text-gray-600 hover:text-black transition-colors"
-                >
-                  + Add Valuation
-                </button>
-              ) : (
-                <div className="space-y-2">
-                  <span className="text-[9px] font-bold uppercase text-gray-400 block">Certify a Valuation</span>
-                  <input
-                    type="text"
-                    placeholder="Certifier address (0x...)"
-                    value={valuationCertifier}
-                    onChange={(e) => setValuationCertifier(e.target.value)}
-                    className="w-full p-2 bg-white border border-gray-200 rounded-lg text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-black"
-                  />
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      inputMode="numeric"
-                      placeholder="Value (smallest unit, e.g. cents)"
-                      value={valuationValue}
-                      onChange={(e) => setValuationValue(e.target.value)}
-                      className="flex-1 p-2 bg-white border border-gray-200 rounded-lg text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-black"
-                    />
-                    <select
-                      value={valuationCurrency}
-                      onChange={(e) => setValuationCurrency(e.target.value as typeof valuationCurrency)}
-                      className="p-2 bg-white border border-gray-200 rounded-lg text-[11px] font-bold focus:outline-none focus:ring-1 focus:ring-black"
-                    >
-                      {CURRENCY_OPTIONS.map(c => <option key={c.code} value={c.code}>{c.code}</option>)}
-                    </select>
-                  </div>
-                  <div className="flex gap-2 pt-1">
-                    <button
-                      onClick={() => setIsAddingValuation(false)}
-                      className="flex-1 py-1.5 border border-gray-200 rounded-lg text-[11px] font-bold text-gray-500 hover:bg-gray-100 transition-all"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      onClick={handleAddValuation}
-                      disabled={isSubmittingValuation}
-                      className="flex-1 py-1.5 bg-black text-white rounded-lg text-[11px] font-bold hover:bg-gray-800 disabled:opacity-50 transition-all"
-                    >
-                      Certify
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
 
             {/* ownership timeline */}
             <div>

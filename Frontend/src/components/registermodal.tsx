@@ -36,7 +36,7 @@ export default function RegisterModal({
   return (
     <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
       <Card className="max-w-md w-full text-center">
-        <h2 className="text-2xl font-bold mb-2 text-black">Welcome to Blockbase</h2>
+        <h2 className="text-2xl font-bold mb-2 text-black">Welcome to PrivacyChain</h2>
         <p className="text-gray-500 mb-6 text-sm">
           Wallet <span className="font-mono text-black">{address?.slice(0, 6)}...{address?.slice(-4)}</span> connected.
         </p>

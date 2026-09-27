@@ -4,6 +4,24 @@ import * as path from 'path';
 import { config } from './config';
 import { deriveKr, generateNonce, encryptBuffer, decryptBuffer } from './crypto';
 
+export type AssertionStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
+
+export interface FinancialAssertion {
+  txId: string;
+  assetId: string;
+  submittedBy: string;
+  counterparty: string | null;
+  status: AssertionStatus;
+  // Both booleans, not a single 'CONFIRMED' status — a sale-price proposal
+  // needs each side tracked independently (see AssetRegistry.confirmFinancialAssertion).
+  // A solo valuation (counterparty null) never needs either to be true.
+  sellerConfirmed: boolean;
+  buyerConfirmed: boolean;
+  createdAt: number;
+  decidedAt: number | null;
+  decidedBy: string | null;
+}
+
 export class KeyStore {
   private db: Database.Database;
 
@@ -31,6 +49,21 @@ export class KeyStore {
         assetId  TEXT PRIMARY KEY,
         txId     TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS financial_assertions (
+        txId            TEXT PRIMARY KEY,
+        assetId         TEXT NOT NULL,
+        submittedBy     TEXT NOT NULL,
+        counterparty    TEXT,
+        status          TEXT NOT NULL DEFAULT 'PENDING',
+        sellerConfirmed INTEGER NOT NULL DEFAULT 0,
+        buyerConfirmed  INTEGER NOT NULL DEFAULT 0,
+        createdAt       INTEGER NOT NULL,
+        decidedAt       INTEGER,
+        decidedBy       TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_assertions_asset ON financial_assertions(assetId);
+      CREATE INDEX IF NOT EXISTS idx_assertions_counterparty ON financial_assertions(counterparty);
     `);
   }
 
@@ -72,6 +105,17 @@ export class KeyStore {
       WHERE userAddress = ? AND destroyed = 0
     `).run(Date.now(), userAddress.toLowerCase());
     return rows.map(r => r.txId);
+  }
+
+  // Destroys a single key by txId — unlike destroyKeysForUser (per-user, used
+  // for RTBF exit), this must not touch any other keys the same owner holds.
+  // Used for reject/decline (a rejected asset or financial assertion) — its
+  // owner's other, unrelated keys must stay untouched.
+  destroyKey(txId: string): void {
+    this.db.prepare(`
+      UPDATE keys SET destroyed = 1, destroyedAt = ?, encryptedKr = '', nonce = NULL
+      WHERE txId = ? AND destroyed = 0
+    `).run(Date.now(), txId);
   }
 
   // The address a txId's key is currently bound to — reflects re-keying, so
@@ -128,5 +172,98 @@ export class KeyStore {
       .prepare('SELECT txId FROM asset_txids WHERE assetId = ?')
       .get(assetId) as { txId: string } | undefined;
     return row?.txId ?? null;
+  }
+
+  // -------------------------------------------------------------------------
+  // Financial assertions (valuations, sale-price proposals) — see
+  // eventListener.ts's onFinancialAssertionRequested/Decided and
+  // routes/assertions.ts. Deliberately no `assertionType` column: whether a
+  // row is a solo valuation or a sale-price proposal is derived from
+  // counterparty IS NULL vs. not, both here and in the L3 dataType string
+  // the Frontend picks when it POSTs the actual content.
+  // -------------------------------------------------------------------------
+
+  createAssertion(params: {
+    txId: string;
+    assetId: string;
+    submittedBy: string;
+    counterparty: string | null;
+    status: AssertionStatus;
+  }): void {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO financial_assertions (txId, assetId, submittedBy, counterparty, status, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      params.txId,
+      params.assetId,
+      params.submittedBy.toLowerCase(),
+      params.counterparty ? params.counterparty.toLowerCase() : null,
+      params.status,
+      Date.now(),
+    );
+  }
+
+  // better-sqlite3 returns INTEGER columns as raw 0/1, not real booleans —
+  // convert here so FinancialAssertion's public shape (and its JSON
+  // serialization out through routes/assertions.ts) is honestly typed.
+  private _mapAssertionRow(row: any): FinancialAssertion {
+    return { ...row, sellerConfirmed: !!row.sellerConfirmed, buyerConfirmed: !!row.buyerConfirmed };
+  }
+
+  getAssertion(txId: string): FinancialAssertion | null {
+    const row = this.db.prepare('SELECT * FROM financial_assertions WHERE txId = ?').get(txId) as any;
+    return row ? this._mapAssertionRow(row) : null;
+  }
+
+  listAssertionsForAsset(assetId: string): FinancialAssertion[] {
+    const rows = this.db
+      .prepare('SELECT * FROM financial_assertions WHERE assetId = ? ORDER BY createdAt DESC')
+      .all(assetId) as any[];
+    return rows.map(r => this._mapAssertionRow(r));
+  }
+
+  listAssertionsForUser(userAddress: string): FinancialAssertion[] {
+    const lower = userAddress.toLowerCase();
+    const rows = this.db
+      .prepare('SELECT * FROM financial_assertions WHERE submittedBy = ? OR counterparty = ? ORDER BY createdAt DESC')
+      .all(lower, lower) as any[];
+    return rows.map(r => this._mapAssertionRow(r));
+  }
+
+  // Admin's review queue — sellerConfirmed/buyerConfirmed are surfaced
+  // per-row so the UI can show "waiting on buyer" etc.; a row here may or
+  // may not be ready for on-chain approval yet (see AssetRegistry's
+  // FinancialAssertionLib.isReadyForApproval, which is the actual gate).
+  listPendingAssertions(): FinancialAssertion[] {
+    const rows = this.db
+      .prepare("SELECT * FROM financial_assertions WHERE status = 'PENDING' ORDER BY createdAt ASC")
+      .all() as any[];
+    return rows.map(r => this._mapAssertionRow(r));
+  }
+
+  // Reacts to AssetRegistry's FinancialAssertionConfirmed event (see
+  // eventListener.ts's onFinancialAssertionConfirmed) — confirmation itself
+  // is an on-chain transaction (confirmFinancialAssertion), not an L2
+  // API call; this just mirrors the resulting state into L2's local view of
+  // the row so the Frontend doesn't need a separate L1 read for display.
+  recordConfirmation(txId: string, confirmedBy: string): void {
+    const row = this.getAssertion(txId);
+    if (!row) return;
+    const lower = confirmedBy.toLowerCase();
+    if (lower === row.submittedBy) {
+      this.db.prepare('UPDATE financial_assertions SET sellerConfirmed = 1 WHERE txId = ?').run(txId);
+    } else if (row.counterparty && lower === row.counterparty) {
+      this.db.prepare('UPDATE financial_assertions SET buyerConfirmed = 1 WHERE txId = ?').run(txId);
+    }
+  }
+
+  // Admin's on-chain decision, mirrored into L2's local view of the row —
+  // called from eventListener.ts's onFinancialAssertionDecided, not directly
+  // from a route (the decision itself is an L1 transaction, see AssetRegistry.decideFinancialAssertion).
+  decideAssertion(txId: string, status: 'APPROVED' | 'REJECTED', decidedBy: string): void {
+    this.db.prepare(`
+      UPDATE financial_assertions SET status = ?, decidedAt = ?, decidedBy = ?
+      WHERE txId = ?
+    `).run(status, Date.now(), decidedBy.toLowerCase(), txId);
   }
 }

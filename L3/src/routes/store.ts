@@ -8,7 +8,7 @@ export function storeRouter(): Router {
   const router = Router();
 
   // POST /store
-  // Body: { txId: string, dataType: "USER_PII" | "ASSET_METADATA", data: object }
+  // Body: { txId: string, dataType: "USER_PII" | "ASSET_METADATA" | "VALUATION" | "SALE_PRICE", data: object }
   //
   // Supported schemas (see src/types.ts for full TypeScript types):
   //
@@ -22,14 +22,11 @@ export function storeRouter(): Router {
   //       metadata?: Record<string,string>, — open key-value pairs (location, size, year, …)
   //       imageCids?: string[]          — CIDs of encrypted image blobs (from POST /images)
   //     }
-  //     Note: on-chain valuations (certifier + value) live in L1 via addValuation().
   //
-  // Flow:
-  //   1. Fetch Kr from L2 (blocks if key not yet derived)
-  //   2. Encrypt data with AES-256-GCM using Kr
-  //   3. Pin the encrypted blob to Helia IPFS
-  //   4. Register the CID in L3's own index
-  //   5. Return the CID to the caller (L2, on the Frontend's behalf)
+  //   VALUATION / SALE_PRICE — content behind a requestFinancialAssertion() txId minted
+  //   on L1 (no counterparty for VALUATION, buyer address for SALE_PRICE); L2 tracks the
+  //   PENDING/CONFIRMED/APPROVED/REJECTED lifecycle, not L3:
+  //     { value: string, currencyCode: string, entity?: string }
   router.post('/', async (req, res) => {
     const { txId, dataType, data } = req.body as {
       txId?: string;

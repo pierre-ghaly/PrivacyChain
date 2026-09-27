@@ -14,7 +14,7 @@ library AssetLib {
     // Types
     // -------------------------------------------------------------------------
 
-    enum Status { PENDING, ACTIVE }
+    enum Status { PENDING, ACTIVE, REJECTED }
     enum DispositionType { TRANSFER, BURN }
 
     // CREATED  = asset was minted (from = address(0))
@@ -37,18 +37,13 @@ library AssetLib {
         Status status;
         uint256 createdAt;
         bool exists;
-    }
-
-    /**
-     * @notice On-chain valuation record.  Certifier is the issuing authority (appraiser, bank, oracle).
-     *         Value is stored in the smallest currency unit (e.g., USD cents, EUR cents).
-     *         These are public records — sensitive appraisal documents belong in L3 ASSET_METADATA.
-     */
-    struct Valuation {
-        address certifier;   // issuing authority (human-entered address or oracle contract)
-        uint256 value;       // asset value in smallest currency unit
-        bytes3 currencyCode; // ISO 4217 code (e.g., "USD", "EUR", "GBP")
-        uint256 certifiedAt; // block.timestamp when the valuation was recorded
+        // ---- append new fields below this line ----
+        // Gates whether this asset appears in the public Explorer listing —
+        // ANDed with the owner's own per-user assetsPublic flag (UserConfigLib).
+        // Owner-only to set; the platform's default-for-new-assets policy
+        // (AssetRegistry.platformDefaultAssetVisibility) only ever seeds this
+        // at creation time, never overrides it afterward.
+        bool isPublic;
     }
 
     /**
@@ -65,7 +60,6 @@ library AssetLib {
         uint256 nextAssetId;
         // ---- append new fields below this line ----
         mapping(uint256 => OwnershipEvent[]) ownershipHistory;
-        mapping(uint256 => Valuation[]) assetValuations;
     }
 
     // -------------------------------------------------------------------------
@@ -76,7 +70,8 @@ library AssetLib {
         Registry storage r,
         string memory _name,
         address _owner,
-        uint256 _txId
+        uint256 _txId,
+        bool _isPublic
     ) internal returns (uint256 assetId) {
         assetId = r.nextAssetId++;
         r.assets[assetId] = Asset({
@@ -84,7 +79,8 @@ library AssetLib {
             name: _name,
             status: Status.PENDING,
             createdAt: block.timestamp,
-            exists: true
+            exists: true,
+            isPublic: _isPublic
         });
         r.assetToOwner[assetId] = _owner;
         r.ownerAssetCount[_owner]++;
@@ -100,6 +96,14 @@ library AssetLib {
 
     function approve(Registry storage r, uint256 _assetId) internal {
         r.assets[_assetId].status = Status.ACTIVE;
+    }
+
+    function reject(Registry storage r, uint256 _assetId) internal {
+        r.assets[_assetId].status = Status.REJECTED;
+    }
+
+    function setVisibility(Registry storage r, uint256 _assetId, bool _isPublic) internal {
+        r.assets[_assetId].isPublic = _isPublic;
     }
 
     function transfer(
@@ -143,21 +147,6 @@ library AssetLib {
         }));
     }
 
-    function addValuation(
-        Registry storage r,
-        uint256 _assetId,
-        address _certifier,
-        uint256 _value,
-        bytes3 _currencyCode
-    ) internal {
-        r.assetValuations[_assetId].push(Valuation({
-            certifier: _certifier,
-            value: _value,
-            currencyCode: _currencyCode,
-            certifiedAt: block.timestamp
-        }));
-    }
-
     // -------------------------------------------------------------------------
     // Views
     // -------------------------------------------------------------------------
@@ -178,13 +167,6 @@ library AssetLib {
         uint256 _assetId
     ) internal view returns (OwnershipEvent[] memory) {
         return r.ownershipHistory[_assetId];
-    }
-
-    function getValuations(
-        Registry storage r,
-        uint256 _assetId
-    ) internal view returns (Valuation[] memory) {
-        return r.assetValuations[_assetId];
     }
 
     // -------------------------------------------------------------------------

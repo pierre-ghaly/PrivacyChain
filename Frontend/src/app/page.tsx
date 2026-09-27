@@ -19,11 +19,9 @@ export default function Home() {
   const { address, isConnected } = useAccount();
   const { disconnect } = useDisconnect();
   
-  // hook to send registration transaction
   const { writeContractAsync } = useWriteContract();
   const { signMessageAsync } = useSignMessage();
 
-  // fetch user registration status on-chain
   const { data: userStruct, refetch: checkRegistration } = useReadContract({
     address: ASSET_REGISTRY_ADDRESS,
     abi: ASSET_REGISTRY_ABI,

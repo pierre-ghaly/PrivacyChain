@@ -22,7 +22,7 @@ function rowWithButton(page: Page, text: string, buttonName: string) {
     .last();
 }
 
-// Walks the full RTBF demonstration sequence described in the root README through the real
+// Walks the full RTBF demonstration sequence through the real
 // UI: register (with off-chain PII) -> admin approval -> create an asset
 // (with off-chain metadata) -> admin approval -> confirm L3 metadata is
 // readable via the explorer -> request erasure -> confirm L2 anchors the
@@ -49,7 +49,7 @@ test('register, approve, create asset, and erase — full RTBF sequence', async 
   await test.step('user connects and registers with PII', async () => {
     await userPage.goto('/');
     await connectWallet(userPage);
-    await expect(userPage.getByText('Welcome to Blockbase')).toBeVisible();
+    await expect(userPage.getByText('Welcome to PrivacyChain')).toBeVisible();
     await userPage.getByPlaceholder('Jane Doe').fill('E2E Test User');
     await userPage.getByPlaceholder('jane@example.com').fill('e2e@test.local');
     await userPage.getByRole('button', { name: 'Sign to Register' }).click();

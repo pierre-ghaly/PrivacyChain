@@ -4,19 +4,15 @@ import { decryptData } from '../crypto.js';
 import { fetchKey } from '../l2Client.js';
 import { getCid } from '../cidStore.js';
 
-// Shared by both routes below:
-//   1. Fetch encrypted blob from Helia IPFS by CID  (always succeeds — IPFS is immutable)
-//   2. Fetch Kr from L2 for the given txId
-//   3a. If key exists → decrypt → return plaintext JSON
-//   3b. If key is destroyed (410) → return 410 with the raw CID
-//       (demonstrates that the blob exists but is computationally inaccessible)
+// Shared by both routes below. The blob is fetched before the key, on
+// purpose: even once Kr is destroyed (410), this still proves the
+// encrypted blob remains on IPFS — cryptographic erasure, not deletion.
 async function respondWithDecrypted(
   res: Response,
   cid: string,
   txId: string,
   extra: Record<string, unknown> = {},
 ): Promise<void> {
-  // Always fetch from the store first — demonstrates the blob still exists
   let encryptedBlob: Buffer;
   try {
     encryptedBlob = await getBytes(cid);
@@ -27,8 +23,6 @@ async function respondWithDecrypted(
 
   const key = await fetchKey(txId);
   if (!key) {
-    // Key destroyed — cryptographic erasure complete.
-    // The blob is still on IPFS (pinned), but permanently unreadable.
     res.status(410).json({
       error: 'Cryptographic erasure complete — decryption key has been destroyed.',
       cid,
@@ -67,8 +61,8 @@ export function retrieveRouter(): Router {
 
   // GET /retrieve/by-tx/:txId?dataType=USER_PII|ASSET_METADATA
   // Resolves the CID internally via L3's own index, so callers never need
-  // to know or handle a raw CID for the metadata case. L3 is fully
-  // self-contained for this lookup — L2 no longer tracks CIDs at all.
+  // to know or handle a raw CID for the metadata case — L2 doesn't track
+  // CIDs at all, only txIds.
   router.get('/by-tx/:txId', async (req, res) => {
     const { txId } = req.params;
     const dataType = req.query.dataType as string | undefined;

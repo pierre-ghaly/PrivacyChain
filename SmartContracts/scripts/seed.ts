@@ -7,7 +7,8 @@ import * as path from "path";
  *
  * Reads the current deployment from ../shared/deployments/<network>.json,
  * then uses Hardhat's deterministic test accounts to populate realistic
- * fixtures (registered users, assets, transfers, valuations).
+ * fixtures (registered users, assets, transfers, financial assertions,
+ * rejections, and a public/private asset visibility mix).
  *
  * Why a seed script instead of on-disk chain persistence?
  *   • Deterministic: every developer gets the same starting state after
@@ -21,13 +22,15 @@ import * as path from "path";
  *   • Account #1 = Alice  (assetsPublic + transactionsPublic, TRANSFER_TO_USER → Bob)
  *   • Account #2 = Bob    (private, BURN-on-inactive)
  *   • Account #3 = Carol  (assetsPublic, transactions private, TRANSFER_TO_SYSTEM default)
- *   • Accounts #4+ = intentionally unregistered (test "not-registered" UX state)
+ *   • Account #4 = Dave   (registered, submits PII, then rejected — compliance demo)
+ *   • Accounts #5+ = intentionally unregistered (test "not-registered" UX state)
  *
  * Final asset distribution after all transfers:
- *   Alice:  Downtown Apartment (#0), Gold Sovereign Collection (#5 via Carol)
- *   Bob:    Classic Sports Car (#1 via Alice), Abstract Oil Painting (#2), Industrial Land Plot (#3)
+ *   Alice:  Downtown Apartment (#0, public), Gold Sovereign Collection (#5 via Carol)
+ *   Bob:    Classic Sports Car (#1 via Alice, public), Abstract Oil Painting (#2), Industrial Land Plot (#3)
  *   Carol:  Vintage Rolex Watch (#4)
  *   System: Harbour Warehouse Unit (#6)
+ *   Rejected: Disputed Artifact (created and rejected, not distributed)
  */
 
 // UserConfigLib.InactivePolicy enum
@@ -37,36 +40,48 @@ const InactivePolicy = {
   BURN: 2,
 } as const;
 
-// ISO 4217 currency codes as bytes3 hex literals
-const USD = "0x555344";
-const EUR = "0x455552";
-const GBP = "0x474250";
+const L2_URL = process.env.L2_URL ?? "http://127.0.0.1:3001";
 
-const L3_URL = process.env.L3_URL ?? "http://127.0.0.1:3002";
-// This script calls L3 directly (bypassing L2's /l3/* proxy) to seed fixture
-// data before any Frontend session exists — L3 requires this on every route
-// but /health.
-const L3_INTERNAL_KEY = process.env.L3_INTERNAL_KEY ?? "dev-only-l2-l3-shared-secret-change-in-production";
+// Signs L2's SIWE-lite session challenge with a real Hardhat signer — the
+// exact same nonce-then-sign flow the Frontend's getAuthHeader() performs
+// with a real wallet (see l2Auth.ts). Seeding through L2's own /l3/store
+// gateway, instead of writing to L3 directly, means a broken auth check or
+// ownership rule in that gateway shows up as a loud warning on every single
+// `npm run dev`, not just whenever the e2e suite or a manual QA pass happens
+// to exercise it.
+async function getL2AuthHeader(signer: any): Promise<string> {
+  const address = await signer.getAddress();
+  const nonceRes = await fetch(`${L2_URL}/auth/nonce?address=${address}`);
+  if (!nonceRes.ok) {
+    throw new Error(`Failed to fetch L2 auth nonce: HTTP ${nonceRes.status}`);
+  }
+  const { message } = (await nonceRes.json()) as { message: string };
+  const signature = await signer.signMessage(message);
+  return `${address} ${signature}`;
+}
 
-async function seedL3Metadata(
+async function seedL3(
+  signer: any,
   txId: string,
-  metadata: Record<string, unknown>
+  dataType: "ASSET_METADATA" | "USER_PII" | "VALUATION" | "SALE_PRICE",
+  data: Record<string, unknown>
 ): Promise<void> {
   try {
-    const res = await fetch(`${L3_URL}/store`, {
+    const authHeader = await getL2AuthHeader(signer);
+    const res = await fetch(`${L2_URL}/l3/store`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Internal-Key": L3_INTERNAL_KEY },
-      body: JSON.stringify({ txId, dataType: "ASSET_METADATA", data: metadata }),
+      headers: { "Content-Type": "application/json", "Authorization": authHeader },
+      body: JSON.stringify({ txId, dataType, data }),
     });
     if (!res.ok) {
       const body = await res.text();
-      console.warn(`  [L3] Failed to seed metadata for txId=${txId}: ${body}`);
+      console.warn(`  [L2] Failed to seed ${dataType} for txId=${txId}: HTTP ${res.status} ${body}`);
     } else {
       const { cid } = (await res.json()) as { cid: string };
-      console.log(`  [L3] Stored ASSET_METADATA txId=${txId} → CID=${cid}`);
+      console.log(`  [L2→L3] Stored ${dataType} txId=${txId} → CID=${cid}`);
     }
   } catch (err: any) {
-    console.warn(`  [L3] L3 unreachable for txId=${txId}: ${err.message}`);
+    console.warn(`  [L2] Unreachable while seeding ${dataType} for txId=${txId}: ${err.message}`);
   }
 }
 
@@ -86,6 +101,29 @@ function extractAssetCreated(
   };
 }
 
+// Extracts the txId from the UserRegistered event in a registerUser() receipt
+// — this is the txId a real registration flow POSTs USER_PII under.
+function extractUserRegisteredTxId(registry: any, rcpt: any): string {
+  const ev = rcpt?.logs
+    .map((l: any) => {
+      try { return registry.interface.parseLog(l); } catch { return null; }
+    })
+    .find((p: any) => p && p.name === "UserRegistered");
+  return (ev?.args?.[1] ?? 0n).toString() as string;
+}
+
+// Extracts the txId from the FinancialAssertionRequested event — this is the
+// txId a valuation/sale-price submission POSTs its (off-chain, never on-chain)
+// content under.
+function extractFinancialAssertionRequested(registry: any, rcpt: any): string {
+  const ev = rcpt?.logs
+    .map((l: any) => {
+      try { return registry.interface.parseLog(l); } catch { return null; }
+    })
+    .find((p: any) => p && p.name === "FinancialAssertionRequested");
+  return (ev?.args?.[3] ?? 0n).toString() as string;
+}
+
 async function main() {
   const networkName = (await ethers.provider.getNetwork()).name || "localhost";
   const chainId = Number((await ethers.provider.getNetwork()).chainId);
@@ -101,7 +139,7 @@ async function main() {
   const deployment = JSON.parse(fs.readFileSync(deploymentFile, "utf8"));
   const contractAddress = deployment.contracts.AssetRegistry.address;
 
-  const [admin, alice, bob, carol] = await ethers.getSigners();
+  const [admin, alice, bob, carol, dave] = await ethers.getSigners();
   const registry = await ethers.getContractAt("AssetRegistry", contractAddress) as any;
 
   console.log("Seeding AssetRegistry at", contractAddress);
@@ -109,6 +147,7 @@ async function main() {
   console.log("  alice  (#1) =", alice.address);
   console.log("  bob    (#2) =", bob.address);
   console.log("  carol  (#3) =", carol.address);
+  console.log("  dave   (#4) =", dave.address, " ← registered then rejected (compliance demo)");
   console.log("");
 
   // -------------------------------------------------------------------------
@@ -116,14 +155,45 @@ async function main() {
   // -------------------------------------------------------------------------
   console.log("Registering and approving users...");
 
-  await (await registry.connect(alice).registerUser()).wait();
+  const aliceRegRcpt = await (await registry.connect(alice).registerUser()).wait();
   await (await registry.connect(admin).approveUser(alice.address)).wait();
 
-  await (await registry.connect(bob).registerUser()).wait();
+  const bobRegRcpt = await (await registry.connect(bob).registerUser()).wait();
   await (await registry.connect(admin).approveUser(bob.address)).wait();
 
-  await (await registry.connect(carol).registerUser()).wait();
+  const carolRegRcpt = await (await registry.connect(carol).registerUser()).wait();
   await (await registry.connect(admin).approveUser(carol.address)).wait();
+
+  const userPiiFixtures: Array<{ signer: any; txId: string; data: Record<string, unknown> }> = [
+    {
+      signer: alice,
+      txId: extractUserRegisteredTxId(registry, aliceRegRcpt),
+      data: { realName: "Alice Moreau", email: "alice.moreau@example.com", address: "14 Rue de Rivoli, Paris" },
+    },
+    {
+      signer: bob,
+      txId: extractUserRegisteredTxId(registry, bobRegRcpt),
+      data: { realName: "Bob Keller", email: "bob.keller@example.com" },
+    },
+    {
+      signer: carol,
+      txId: extractUserRegisteredTxId(registry, carolRegRcpt),
+      data: { realName: "Carol Dubois", email: "carol.dubois@example.com", address: "9 Quai de la Joliette, Marseille" },
+    },
+  ];
+
+  // -------------------------------------------------------------------------
+  // Dave: registers, submits PII, then gets rejected outright (e.g. a failed
+  // compliance check) — demonstrates the reject/decline path and its
+  // key-destruction consequence. Posting PII before rejecting is deliberate:
+  // it's the scenario the feature exists for (data submitted before admin
+  // ever reviewed it must not linger decryptable under a rejected account).
+  // -------------------------------------------------------------------------
+  console.log("Registering and rejecting dave (compliance demo)...");
+  const daveRegRcpt = await (await registry.connect(dave).registerUser()).wait();
+  const daveRegTxId = extractUserRegisteredTxId(registry, daveRegRcpt);
+  await seedL3(dave, daveRegTxId, "USER_PII", { realName: "Dave Whitfield", email: "dave.whitfield@example.com" });
+  await (await registry.connect(admin).rejectUser(dave.address)).wait();
 
   // -------------------------------------------------------------------------
   // Per-user configuration
@@ -307,50 +377,123 @@ async function main() {
   //   System: #6 Harbour Warehouse Unit
 
   // -------------------------------------------------------------------------
-  // On-chain valuations
-  // Stored as smallest currency unit (cents/pence). Admin certifies most;
-  // current owners can also certify their own assets.
+  // Explorer visibility — a mix of public/private assets for Explorer demos.
+  // Owner-only, so must run after the transfers above put each asset with
+  // its final owner. Everything else stays at its private-by-default value.
   // -------------------------------------------------------------------------
-  console.log("Adding on-chain valuations...");
+  console.log("Setting a public/private asset visibility mix...");
+  await (await registry.connect(alice).setAssetVisibility(assetIds[0], true)).wait(); // Downtown Apartment -> public
+  await (await registry.connect(bob).setAssetVisibility(assetIds[1], true)).wait();   // Classic Sports Car -> public
 
-  // Downtown Apartment (#0): two appraisals showing value appreciation
-  await (await registry.connect(admin).addValuation(assetIds[0], admin.address, 45000000n, USD)).wait();
-  await (await registry.connect(admin).addValuation(assetIds[0], admin.address, 48000000n, USD)).wait();
+  // -------------------------------------------------------------------------
+  // A rejected asset — demonstrates the reject/decline path for a pending
+  // asset, same key-destruction-on-reject principle as dave's rejection above.
+  // -------------------------------------------------------------------------
+  console.log("Creating and rejecting an asset (compliance demo)...");
+  const rejectedAssetRcpt = await (await registry.connect(admin).createAsset("Disputed Artifact")).wait();
+  const { id: rejectedAssetId, txId: rejectedAssetTxId } = extractAssetCreated(registry, rejectedAssetRcpt);
+  await seedL3(admin, rejectedAssetTxId, "ASSET_METADATA", {
+    description: "Provenance could not be verified — held for compliance review.",
+    category: "Disputed",
+  });
+  await (await registry.connect(admin).rejectAsset(rejectedAssetId)).wait();
 
-  // Industrial Land Plot (#3): single appraisal in EUR
-  await (await registry.connect(admin).addValuation(assetIds[3], admin.address, 380000000n, EUR)).wait();
+  // -------------------------------------------------------------------------
+  // Financial assertions (valuations + one sale-price proposal) — off-chain,
+  // admin-approved. Mints a txId on-chain (requestFinancialAssertion), posts
+  // the real value through L2's /l3/store like any other off-chain write,
+  // then admin decides on-chain (decideFinancialAssertion) — no price/value
+  // ever touches L1. Admin certifies most valuations; current owners can
+  // also self-certify their own assets. A sale-price proposal (counterparty
+  // set) additionally requires both parties to call confirmFinancialAssertion
+  // on-chain before admin's approval succeeds — see the sale-price block below.
+  // -------------------------------------------------------------------------
+  console.log("Requesting and approving financial assertions (valuations)...");
 
-  // Abstract Oil Painting (#2): gallery valuation in EUR
-  await (await registry.connect(admin).addValuation(assetIds[2], admin.address, 1200000n, EUR)).wait();
+  type AssertionFixture = { signer: any; assetIndex: number; data: Record<string, unknown> };
+  const assertionFixtures: AssertionFixture[] = [
+    // Downtown Apartment (#0): two appraisals showing value appreciation
+    { signer: admin, assetIndex: 0, data: { value: 450000, currencyCode: "USD", entity: "Admin-certified appraisal" } },
+    { signer: admin, assetIndex: 0, data: { value: 480000, currencyCode: "USD", entity: "Admin-certified appraisal (follow-up)" } },
+    // Industrial Land Plot (#3): single appraisal
+    { signer: admin, assetIndex: 3, data: { value: 3800000, currencyCode: "EUR", entity: "Admin-certified appraisal" } },
+    // Abstract Oil Painting (#2): gallery valuation
+    { signer: admin, assetIndex: 2, data: { value: 12000, currencyCode: "EUR", entity: "Gallery valuation" } },
+    // Gold Sovereign Collection (#5): Alice (current owner) self-certifies spot price
+    { signer: alice, assetIndex: 5, data: { value: 8500, currencyCode: "GBP", entity: "Self-certified spot price" } },
+    // Classic Sports Car (#1): Bob (current owner) self-certifies auction estimate
+    { signer: bob, assetIndex: 1, data: { value: 85000, currencyCode: "USD", entity: "Auction estimate" } },
+  ];
 
-  // Gold Sovereign Collection (#5): Alice (current owner) adds spot-price valuation in GBP
-  await (await registry.connect(alice).addValuation(assetIds[5], alice.address, 850000n, GBP)).wait();
+  for (const fixture of assertionFixtures) {
+    const assetId = assetIds[fixture.assetIndex];
+    const rcpt = await (await registry.connect(fixture.signer).requestFinancialAssertion(assetId, ethers.ZeroAddress)).wait();
+    const txId = extractFinancialAssertionRequested(registry, rcpt);
+    await seedL3(fixture.signer, txId, "VALUATION", fixture.data);
+    await (await registry.connect(admin).decideFinancialAssertion(txId, true)).wait();
+  }
 
-  // Classic Sports Car (#1): Bob (current owner) adds auction-estimate valuation
-  await (await registry.connect(bob).addValuation(assetIds[1], bob.address, 8500000n, USD)).wait();
+  // One real sale-price proposal, demonstrating the both-parties-confirm
+  // gate: admin's decideFinancialAssertion(true) reverts on-chain unless
+  // both the seller (Bob) and buyer (Carol) have called
+  // confirmFinancialAssertion first — see AssetRegistry.sol.
+  console.log("Requesting, confirming (both sides), and approving a sale-price proposal...");
+  {
+    const assetId = assetIds[1]; // Classic Sports Car, owned by Bob
+    const rcpt = await (
+      await registry.connect(bob).requestFinancialAssertion(assetId, carol.address)
+    ).wait();
+    const txId = extractFinancialAssertionRequested(registry, rcpt);
+    await seedL3(bob, txId, "SALE_PRICE", { value: 92000, currencyCode: "USD" });
+    await (await registry.connect(bob).confirmFinancialAssertion(txId)).wait();
+    await (await registry.connect(carol).confirmFinancialAssertion(txId)).wait();
+    await (await registry.connect(admin).decideFinancialAssertion(txId, true)).wait();
+  }
 
   // -------------------------------------------------------------------------
   // L3 encrypted metadata
-  // Posts ASSET_METADATA to L3 for each asset using the creation txId.
-  // L2 must have derived Kr for these txIds before L3 can encrypt.
-  // Safe to skip if L3 is not running — seed continues with a warning.
+  // Posts ASSET_METADATA through L2's /l3/store gateway for each asset,
+  // using the creation txId — admin created every asset, and still owns
+  // that txId's key in L2 regardless of who owns the asset now (transfers
+  // rekey a *new* txId to the new owner; they don't touch the original
+  // creation txId's ownership record). L2 must have derived Kr for these
+  // txIds before L3 can encrypt. Safe to skip if L2/L3 is not running —
+  // seed continues with a warning.
   // -------------------------------------------------------------------------
-  console.log("Seeding L3 encrypted metadata (skipped if L3 is offline)...");
+  console.log("Seeding L3 encrypted metadata via L2 (skipped if L2/L3 is offline)...");
   for (let i = 0; i < assetFixtures.length; i++) {
-    await seedL3Metadata(assetTxIds[i], assetFixtures[i].metadata);
+    await seedL3(admin, assetTxIds[i], "ASSET_METADATA", assetFixtures[i].metadata);
+  }
+
+  // -------------------------------------------------------------------------
+  // L3 encrypted PII
+  // Posts USER_PII through L2's /l3/store gateway for each registered user,
+  // signed by that user's own registration txId, so a seeded account's
+  // Settings page shows real PII instead of "No PII on record" — matching
+  // what a hand-registered account would show.
+  // -------------------------------------------------------------------------
+  console.log("Seeding L3 encrypted PII via L2 (skipped if L2/L3 is offline)...");
+  for (const fixture of userPiiFixtures) {
+    await seedL3(fixture.signer, fixture.txId, "USER_PII", fixture.data);
   }
 
   console.log("");
   console.log("Seed complete. Summary:");
-  console.log("  • 3 registered users: alice (#1), bob (#2), carol (#3)");
-  console.log("  • 7 assets created and approved:");
-  console.log("    Alice  → Downtown Apartment (#0), Gold Sovereign Collection (#5 from Carol)");
-  console.log("    Bob    → Classic Sports Car (#1 from Alice), Abstract Oil Painting (#2), Industrial Land Plot (#3)");
+  console.log("  • 3 registered+active users: alice (#1), bob (#2), carol (#3)");
+  console.log("  • dave (#4): registered then rejected — compliance demo, key destroyed");
+  console.log("  • 7 assets created and approved, 1 asset created and rejected:");
+  console.log("    Alice  → Downtown Apartment (#0, public), Gold Sovereign Collection (#5 from Carol)");
+  console.log("    Bob    → Classic Sports Car (#1 from Alice, public), Abstract Oil Painting (#2), Industrial Land Plot (#3)");
   console.log("    Carol  → Vintage Rolex Watch (#4)");
   console.log("    System → Harbour Warehouse Unit (#6)");
-  console.log("  • Valuations: Downtown Apartment (2×USD), Industrial Land Plot (EUR),");
-  console.log("                Abstract Oil Painting (EUR), Gold Sovereign Collection (GBP), Classic Sports Car (USD)");
-  console.log("  • Accounts #4+ left unregistered (for testing unregistered UX)");
+  console.log("    Rejected → Disputed Artifact — compliance demo, key destroyed");
+  console.log("  • Financial assertions (off-chain, admin-approved): Downtown Apartment (2×USD),");
+  console.log("    Industrial Land Plot (EUR), Abstract Oil Painting (EUR), Gold Sovereign Collection (GBP),");
+  console.log("    Classic Sports Car valuation (USD) — no price/value ever touched L1");
+  console.log("  • One sale-price proposal: Classic Sports Car, Bob → Carol (USD) — both parties");
+  console.log("    confirmed on-chain (confirmFinancialAssertion) before admin approved");
+  console.log("  • Explorer access mode still REGISTERED_ONLY (platform default) — toggle via setExplorerAccessMode to demo public browsing");
+  console.log("  • Accounts #5+ left unregistered (for testing unregistered UX)");
 }
 
 main().catch((err) => {

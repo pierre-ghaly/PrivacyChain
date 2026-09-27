@@ -10,11 +10,23 @@ import { sseManager } from './sseManager';
 // second call can race the first and reuse a stale nonce. NonceManager
 // tracks nonces in-process instead, so kept as a module-level singleton
 // (one per admin signer) rather than recreated per call.
+//
+// eventListener.ts tears down and replaces its WebSocketProvider on every
+// reconnect (heartbeat failure, socket close, or the periodic forced
+// resubscribe — see eventListener.ts), and passes whichever provider is
+// current into performErasure each time. A signer cached against the
+// *first* provider forever would silently keep using it after later
+// reconnects destroy it, so recordErasureProof() would fail with
+// "provider destroyed" on every call after the first reconnect — track
+// which provider the cached signer was built against and rebuild it
+// whenever that identity changes, rather than caching unconditionally.
 let adminSigner: ethers.NonceManager | null = null;
+let adminSignerProvider: ethers.WebSocketProvider | null = null;
 
 function getAdminSigner(provider: ethers.WebSocketProvider): ethers.NonceManager {
-  if (!adminSigner) {
+  if (!adminSigner || adminSignerProvider !== provider) {
     adminSigner = new ethers.NonceManager(new ethers.Wallet(config.adminPrivateKey, provider));
+    adminSignerProvider = provider;
   }
   return adminSigner;
 }
@@ -40,7 +52,7 @@ export async function performErasure(
   const contract = new ethers.Contract(contractAddress, contractAbi, signer);
 
   try {
-    const tx = await (contract as any).recordErasureProof(user, proofHash);
+    const tx = await (contract as any).recordErasureProof(user, proofHash, timestamp);
     const receipt = await tx.wait();
     console.log(`[L2] recordErasureProof confirmed (block ${receipt.blockNumber}): ${tx.hash}`);
 

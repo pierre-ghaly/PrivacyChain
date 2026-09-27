@@ -29,14 +29,12 @@ export async function stopIpfs(): Promise<void> {
   await heliaNode?.stop();
 }
 
-// Pins raw bytes to IPFS and returns the CID string.
 export async function pinBytes(data: Uint8Array): Promise<string> {
   if (!heliaFs) throw new Error('Helia not initialised');
   const cid = await heliaFs.addBytes(data);
   return cid.toString();
 }
 
-// Retrieves bytes from IPFS by CID string.
 export async function getBytes(cidStr: string): Promise<Buffer> {
   if (!heliaFs) throw new Error('Helia not initialised');
   const cid = CID.parse(cidStr);

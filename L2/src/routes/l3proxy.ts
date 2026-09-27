@@ -61,8 +61,8 @@ export function l3ProxyRouter(keyStore: KeyStore): Router {
   });
 
   // GET /l3/data/:txId?dataType=USER_PII|ASSET_METADATA
-  // Metadata lookup by txId, not CID — replaces the old two-step
-  // (GET /keys/cids/:txId then GET /l3/retrieve/:cid) flow with one call.
+  // Metadata lookup by txId, not CID — resolves the CID internally in one
+  // call rather than requiring the caller to look it up separately first.
   // Owner-only: currently only used for a user viewing their own PII.
   router.get('/data/:txId', requireAuth, async (req, res) => {
     // req.params is over-broadly typed as string | string[] once a

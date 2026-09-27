@@ -1,8 +1,8 @@
 'use client';
 import { Card } from "@/components/card";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { toast } from "sonner";
-import { useReadContract, useWriteContract, useAccount, usePublicClient, useSignMessage } from "wagmi";
+import { useReadContract, useWriteContract, useAccount, usePublicClient, useSignMessage, useWatchContractEvent } from "wagmi";
 import { isAddress } from "viem";
 import { ASSET_REGISTRY_ADDRESS, ASSET_REGISTRY_ABI, CURRENCY_OPTIONS, L2_SERVER_URL } from "@/contracts";
 import { getAuthHeader } from "@/lib/l2Auth";
@@ -15,12 +15,7 @@ interface Asset {
   status: string;
   createdAt: bigint;
   owner: string;
-  valuations: Array<{
-    certifier: string;
-    value: bigint;
-    currencyCode: string;
-    certifiedAt: bigint;
-  }>;
+  isPublic: boolean;
   contract: string;
 }
 
@@ -34,15 +29,25 @@ interface AssetHistoryEvent {
   keyDestroyed: boolean;
 }
 
-function decodeBytes3(hex: string): string {
-  if (!hex || !hex.startsWith('0x')) return hex;
-  try {
-    return hex.slice(2).match(/.{1,2}/g)!
-      .map(b => String.fromCharCode(parseInt(b, 16)))
-      .join('')
-      .replace(/\x00/g, '');
-  } catch { return hex; }
+// A financial assertion (valuation or sale-price proposal) as returned by
+// L2's GET /assertions — see L2/src/routes/assertions.ts. `data` is the
+// decrypted L3 content (null while pending signature/auth, or if erased).
+interface FinancialAssertion {
+  txId: string;
+  assetId: string;
+  submittedBy: string;
+  counterparty: string | null;
+  status: 'PENDING' | 'APPROVED' | 'REJECTED';
+  // Both tracked independently — a sale-price proposal needs each side's
+  // own on-chain confirmFinancialAssertion call; a solo valuation (no
+  // counterparty) never needs either. See AssetRegistry.sol.
+  sellerConfirmed: boolean;
+  buyerConfirmed: boolean;
+  data: Record<string, unknown> | null;
+  erased: boolean;
 }
+
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
 export default function MyAssetsPage() {
   const { address } = useAccount();
@@ -71,13 +76,26 @@ export default function MyAssetsPage() {
   const [l2AssetDetail, setL2AssetDetail] = useState<any>(null);
   const [imageDataUrls, setImageDataUrls] = useState<Record<string, string>>({});
 
+  const [assertions, setAssertions] = useState<Record<string, FinancialAssertion[]>>({});
+
   const [isAddingValuation, setIsAddingValuation] = useState(false);
-  const [valuationCertifier, setValuationCertifier] = useState("");
+  const [valuationEntity, setValuationEntity] = useState("");
   const [valuationValue, setValuationValue] = useState("");
-  const [valuationCurrency, setValuationCurrency] = useState<typeof CURRENCY_OPTIONS[number]["code"]>("USD");
+  const [valuationCurrency, setValuationCurrency] = useState<typeof CURRENCY_OPTIONS[number]>("USD");
   const [isSubmittingValuation, setIsSubmittingValuation] = useState(false);
 
-  // check account registration status on-chain
+  const [isProposingSale, setIsProposingSale] = useState(false);
+  const [salePriceRecipient, setSalePriceRecipient] = useState("");
+  const [salePriceValue, setSalePriceValue] = useState("");
+  const [salePriceCurrency, setSalePriceCurrency] = useState<typeof CURRENCY_OPTIONS[number]>("USD");
+  const [isSubmittingSalePrice, setIsSubmittingSalePrice] = useState(false);
+  const [isCompletingSale, setIsCompletingSale] = useState(false);
+  const [confirmingTxId, setConfirmingTxId] = useState<string | null>(null);
+
+  // Held across the mint-txId -> KEY_READY -> POST-content two-step write
+  // pattern (see createassetform.tsx for the original version of this).
+  const pendingAssertion = useRef<{ assetId: string; dataType: 'VALUATION' | 'SALE_PRICE'; data: Record<string, unknown> } | null>(null);
+
   const { data: userData } = useReadContract({
     address: ASSET_REGISTRY_ADDRESS,
     abi: ASSET_REGISTRY_ABI,
@@ -119,10 +137,12 @@ export default function MyAssetsPage() {
       id: `#${String(detail.id).padStart(4, '0')}`,
       rawId: BigInt(detail.id),
       name: detail.name,
-      status: Number(detail.status) === 0 ? "Pending" : "Public",
+      // AssetLib.Status: 0 = PENDING, 1 = ACTIVE, 2 = REJECTED. Distinct from
+      // isPublic below — this is the admin-approval state, not Explorer visibility.
+      status: Number(detail.status) === 0 ? "Pending" : Number(detail.status) === 1 ? "Active" : "Rejected",
       createdAt: BigInt(detail.createdAt),
       owner: detail.owner as string,
-      valuations: (detail.valuations ?? []) as Asset["valuations"],
+      isPublic: detail.isPublic as boolean,
       contract: ASSET_REGISTRY_ADDRESS
     }));
     setBlockchainAssets(fullAssets);
@@ -177,7 +197,79 @@ export default function MyAssetsPage() {
     fetchL2Detail(selectedAsset.rawId);
   }, [selectedAsset?.rawId, fetchL2Detail]);
 
-  // fetch specific asset timeline and parameters
+  // Fetches this asset's financial assertions (valuations + sale-price
+  // proposals) via L2's aggregation route — each row already carries its
+  // decrypted L3 content, no separate per-assertion fetch needed.
+  const fetchAssertions = useCallback(async (assetId: bigint) => {
+    if (!address) return;
+    try {
+      const authHeader = await getAuthHeader(address, signMessageAsync);
+      const res = await fetch(`${L2_SERVER_URL}/assertions?assetId=${assetId}`, {
+        headers: { 'Authorization': authHeader },
+      });
+      if (res.ok) {
+        const { assertions: rows } = await res.json();
+        setAssertions(prev => ({ ...prev, [assetId.toString()]: rows }));
+      }
+    } catch {
+      // L2 offline, or signature declined — assertions panel just won't show anything
+    }
+  }, [address, signMessageAsync]);
+
+  useEffect(() => {
+    if (!selectedAsset) return;
+    fetchAssertions(selectedAsset.rawId);
+  }, [selectedAsset?.rawId, fetchAssertions]);
+
+  // Live refresh when either party confirms — without this, a seller/buyer
+  // viewing the drawer only sees the counterparty's confirmation after
+  // closing and reopening it, since fetchAssertions otherwise only reruns on
+  // asset-selection change or the viewer's own confirm/propose actions.
+  useWatchContractEvent({
+    address: ASSET_REGISTRY_ADDRESS,
+    abi: ASSET_REGISTRY_ABI,
+    eventName: 'FinancialAssertionConfirmed',
+    onLogs() {
+      if (selectedAsset) fetchAssertions(selectedAsset.rawId);
+    },
+  });
+
+  // Two-step write pattern for financial assertions: requestFinancialAssertion
+  // mints a txId on-chain (handleAddValuation/handleProposeSale below), then
+  // once L2 derives its key and fires KEY_READY, the real content is POSTed
+  // here — same shape as createassetform.tsx's ASSET_METADATA flow.
+  useEffect(() => {
+    const handleKeyReady = async (e: Event) => {
+      const { detail } = e as CustomEvent<{ txId: string; purpose: string; assetId?: string; user: string }>;
+      const pending = pendingAssertion.current;
+      if (detail.purpose !== 'FINANCIAL_ASSERTION' || !pending) return;
+      if (detail.assetId !== pending.assetId || detail.user.toLowerCase() !== address?.toLowerCase()) return;
+
+      pendingAssertion.current = null;
+      try {
+        const authHeader = await getAuthHeader(detail.user, signMessageAsync);
+        const storeRes = await fetch(`${L2_SERVER_URL}/l3/store`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': authHeader },
+          body: JSON.stringify({ txId: detail.txId, dataType: pending.dataType, data: pending.data }),
+        });
+        if (!storeRes.ok) throw new Error(`L3 store failed (${storeRes.status})`);
+        toast.success(
+          pending.dataType === 'SALE_PRICE'
+            ? "Sale price proposed — awaiting buyer confirmation and admin approval."
+            : "Valuation submitted — awaiting admin approval."
+        );
+        fetchAssertions(BigInt(pending.assetId));
+      } catch (err) {
+        console.error(err);
+        toast.error("Assertion requested on-chain, but storing its content on L3 failed.");
+      }
+    };
+
+    window.addEventListener('L2_KEY_READY', handleKeyReady);
+    return () => window.removeEventListener('L2_KEY_READY', handleKeyReady);
+  }, [address, signMessageAsync, fetchAssertions]);
+
   useEffect(() => {
     const fetchAssetTimeline = async () => {
       if (!selectedAsset || !publicClient) return;
@@ -281,7 +373,6 @@ export default function MyAssetsPage() {
     setIsConfirmModalOpen(true);
   };
 
-  // sign and broadcast ownership title update
   const handleFinalTransferAsset = async () => {
     if (!transferringAsset) return;
 
@@ -317,13 +408,15 @@ export default function MyAssetsPage() {
     }
   };
 
-  // certify an on-chain valuation for the currently-open (owned) asset
+  // Request a solo valuation assertion for the currently-open (owned) asset.
+  // Mints a txId on-chain (no value/entity in that call at all); the actual
+  // content is POSTed to L3 once KEY_READY fires (see the effect above).
   const handleAddValuation = async () => {
-    if (!selectedAsset) return;
+    if (!selectedAsset || !address) return;
 
-    const certifier = valuationCertifier.trim();
-    if (!isAddress(certifier)) {
-      toast.error("Please enter a valid certifier wallet address");
+    const entity = valuationEntity.trim();
+    if (!entity) {
+      toast.error("Please enter who is asserting this value (e.g. an appraiser or gallery name)");
       return;
     }
     const trimmedValue = valuationValue.trim();
@@ -331,27 +424,143 @@ export default function MyAssetsPage() {
       toast.error("Please enter a whole number value greater than zero");
       return;
     }
-    const currency = CURRENCY_OPTIONS.find(c => c.code === valuationCurrency)!;
 
     setIsSubmittingValuation(true);
-    const toastId = toast.loading("Anchoring certified valuation on-chain...");
+    const toastId = toast.loading("Requesting financial assertion on-chain...");
+    try {
+      pendingAssertion.current = {
+        assetId: selectedAsset.rawId.toString(),
+        dataType: 'VALUATION',
+        data: { value: Number(trimmedValue), currencyCode: valuationCurrency, entity },
+      };
+      await writeContractAsync({
+        address: ASSET_REGISTRY_ADDRESS,
+        abi: ASSET_REGISTRY_ABI,
+        functionName: 'requestFinancialAssertion',
+        args: [selectedAsset.rawId, ZERO_ADDRESS as `0x${string}`],
+      });
+      toast.success("Assertion minted on-chain — encrypting and storing its content off-chain...", { id: toastId });
+      setIsAddingValuation(false);
+      setValuationEntity("");
+      setValuationValue("");
+      setValuationCurrency("USD");
+    } catch (error: any) {
+      pendingAssertion.current = null;
+      toast.error(error.shortMessage || "Failed to request valuation.", { id: toastId });
+    } finally {
+      setIsSubmittingValuation(false);
+    }
+  };
+
+  // Propose a sale price to a named buyer — a genuine pre-transfer
+  // negotiation step, not a decorative parallel track. The actual
+  // transferAsset() call only becomes available once this assertion is
+  // APPROVED (see handleCompleteSale / the gated button in the JSX below).
+  const handleProposeSale = async () => {
+    if (!selectedAsset || !address) return;
+
+    const recipient = salePriceRecipient.trim();
+    if (!isAddress(recipient)) {
+      toast.error("Please enter a valid buyer wallet address");
+      return;
+    }
+    const trimmedValue = salePriceValue.trim();
+    if (!/^\d+$/.test(trimmedValue) || BigInt(trimmedValue) <= 0n) {
+      toast.error("Please enter a whole number price greater than zero");
+      return;
+    }
+
+    setIsSubmittingSalePrice(true);
+    const toastId = toast.loading("Proposing sale price on-chain...");
+    try {
+      pendingAssertion.current = {
+        assetId: selectedAsset.rawId.toString(),
+        dataType: 'SALE_PRICE',
+        data: { price: Number(trimmedValue), currencyCode: salePriceCurrency },
+      };
+      await writeContractAsync({
+        address: ASSET_REGISTRY_ADDRESS,
+        abi: ASSET_REGISTRY_ABI,
+        functionName: 'requestFinancialAssertion',
+        args: [selectedAsset.rawId, recipient as `0x${string}`],
+      });
+      toast.success("Sale price proposal minted on-chain — encrypting and storing its content off-chain...", { id: toastId });
+      setIsProposingSale(false);
+      setSalePriceRecipient("");
+      setSalePriceValue("");
+      setSalePriceCurrency("USD");
+    } catch (error: any) {
+      pendingAssertion.current = null;
+      toast.error(error.shortMessage || "Failed to propose sale price.", { id: toastId });
+    } finally {
+      setIsSubmittingSalePrice(false);
+    }
+  };
+
+  // Explicit on-chain confirmation from either party to a sale-price
+  // proposal — required from BOTH seller and buyer before admin can approve
+  // (enforced on-chain, not just in this UI; see confirmFinancialAssertion).
+  // Submitting a proposal is not itself confirmation, so the seller confirms
+  // separately too, same as the buyer.
+  const handleConfirmAssertion = async (txId: string) => {
+    setConfirmingTxId(txId);
+    const toastId = toast.loading("Confirming price on-chain...");
     try {
       await writeContractAsync({
         address: ASSET_REGISTRY_ADDRESS,
         abi: ASSET_REGISTRY_ABI,
-        functionName: 'addValuation',
-        args: [selectedAsset.rawId, certifier as `0x${string}`, BigInt(trimmedValue), currency.hex as `0x${string}`],
+        functionName: 'confirmFinancialAssertion',
+        args: [BigInt(txId)],
       });
-      toast.success("Valuation certified and anchored on-chain!", { id: toastId });
-      setIsAddingValuation(false);
-      setValuationCertifier("");
-      setValuationValue("");
-      setValuationCurrency("USD");
+      toast.success("Confirmed.", { id: toastId });
+      if (selectedAsset) fetchAssertions(selectedAsset.rawId);
+    } catch (error: any) {
+      toast.error(error.shortMessage || "Failed to confirm.", { id: toastId });
+    } finally {
+      setConfirmingTxId(null);
+    }
+  };
+
+  // Executes the actual transfer for an approved sale-price assertion —
+  // the plain transferAsset() call, gated in the UI on the assertion's
+  // APPROVED status (the contract itself has no knowledge of this link).
+  const handleCompleteSale = async (assertion: FinancialAssertion) => {
+    if (!selectedAsset || !assertion.counterparty) return;
+
+    setIsCompletingSale(true);
+    const toastId = toast.loading("Executing approved sale transfer...");
+    try {
+      await writeContractAsync({
+        address: ASSET_REGISTRY_ADDRESS,
+        abi: ASSET_REGISTRY_ABI,
+        functionName: 'transferAsset',
+        args: [selectedAsset.rawId, assertion.counterparty as `0x${string}`],
+        gas: 500000n,
+      });
+      toast.success("Ownership title successfully transferred on L1 ledger!", { id: toastId });
       refetch();
     } catch (error: any) {
-      toast.error(error.shortMessage || "Failed to record valuation.", { id: toastId });
+      toast.error(error.shortMessage || "Transfer aborted.", { id: toastId });
     } finally {
-      setIsSubmittingValuation(false);
+      setIsCompletingSale(false);
+    }
+  };
+
+  // Owner-only — admin has no path to call this for someone else's asset,
+  // enforced on-chain by setAssetVisibility itself, not just this UI.
+  const handleSetAssetVisibility = async (assetId: bigint, isPublic: boolean) => {
+    const toastId = toast.loading(isPublic ? "Making asset public..." : "Making asset private...");
+    try {
+      await writeContractAsync({
+        address: ASSET_REGISTRY_ADDRESS,
+        abi: ASSET_REGISTRY_ABI,
+        functionName: 'setAssetVisibility',
+        args: [assetId, isPublic],
+      });
+      toast.success(isPublic ? "Asset is now public in the Explorer." : "Asset is now private.", { id: toastId });
+      refetch();
+    } catch (error: any) {
+      toast.error(error.shortMessage || "Failed to update visibility.", { id: toastId });
     }
   };
 
@@ -406,7 +615,7 @@ export default function MyAssetsPage() {
           onChange={(e) => setSearch(e.target.value)}
         />
         <div className="flex gap-2 bg-gray-100/50 p-1 rounded-xl">
-          {["All", "Public", "Pending"].map((f) => (
+          {["All", "Active", "Pending", "Rejected"].map((f) => (
             <button
               key={f}
               onClick={() => setFilter(f)}
@@ -435,24 +644,39 @@ export default function MyAssetsPage() {
                 <span className="text-[10px] font-bold text-gray-400 tracking-widest uppercase italic">
                   ID: {asset.id}
                 </span>
-                
-                {asset.status === "Public" ? (
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                    Public
+
+                <div className="flex items-center gap-1.5">
+                  {asset.status === "Active" ? (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                      Active
+                    </span>
+                  ) : asset.status === "Rejected" ? (
+                    <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-semibold bg-red-50 text-red-600 border border-red-200">
+                      Rejected
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-semibold bg-gray-100 text-gray-600 border border-gray-200">
+                      Pending
+                    </span>
+                  )}
+                  {/* Explorer visibility — a separate axis from the approval status above */}
+                  <span
+                    title={asset.isPublic ? "Visible in the public Explorer (subject to your own privacy settings)" : "Private — not shown in the Explorer"}
+                    className={`inline-flex items-center px-2 py-1 rounded-full text-[10px] font-semibold border ${
+                      asset.isPublic ? "bg-blue-50 text-blue-600 border-blue-200" : "bg-gray-50 text-gray-400 border-gray-100"
+                    }`}
+                  >
+                    {asset.isPublic ? "Public" : "Private"}
                   </span>
-                ) : (
-                  <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-semibold bg-gray-100 text-gray-600 border border-gray-200">
-                    Pending
-                  </span>
-                )}
+                </div>
               </div>
-              
+
               <h3 className="text-xl font-bold text-black mb-1 group-hover:text-gray-600 transition-colors">
                 {asset.name}
               </h3>
               <p className="text-xs text-gray-400 mb-6">Status updated on-chain</p>
-              
+
               <div className="flex gap-2 mt-auto">
                 <button 
                   onClick={() => setSelectedAsset(asset)}
@@ -460,12 +684,12 @@ export default function MyAssetsPage() {
                 >
                   View Details
                 </button>
-                <button 
-                  disabled={asset.status === "Pending" || !isRegistered || !isActive} 
+                <button
+                  disabled={asset.status !== "Active" || !isRegistered || !isActive}
                   onClick={() => setTransferringAsset(transferringAsset?.rawId === asset.rawId ? null : asset)}
                   className={`flex-1 py-3 rounded-xl text-xs font-bold transition-all border ${
-                    (asset.status === "Pending" || !isRegistered || !isActive)
-                      ? "bg-gray-200 cursor-not-allowed text-gray-400 border-transparent" 
+                    (asset.status !== "Active" || !isRegistered || !isActive)
+                      ? "bg-gray-200 cursor-not-allowed text-gray-400 border-transparent"
                       : "bg-black text-white hover:bg-gray-800 border-black"
                   }`}
                 >
@@ -535,15 +759,26 @@ export default function MyAssetsPage() {
             
             <div className="flex justify-between items-center mb-6">
               <h2 className="text-2xl font-bold text-black">{selectedAsset.name}</h2>
-              {selectedAsset.status === "Public" ? (
-                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> Public
+              <div className="flex items-center gap-1.5">
+                {selectedAsset.status === "Active" ? (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> Active
+                  </span>
+                ) : selectedAsset.status === "Rejected" ? (
+                  <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-semibold bg-red-50 text-red-600 border border-red-200">
+                    Rejected
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-semibold bg-gray-100 text-gray-600 border border-gray-200">
+                    Pending
+                  </span>
+                )}
+                <span className={`inline-flex items-center px-2 py-1 rounded-full text-[10px] font-semibold border ${
+                  selectedAsset.isPublic ? "bg-blue-50 text-blue-600 border-blue-200" : "bg-gray-50 text-gray-400 border-gray-100"
+                }`}>
+                  {selectedAsset.isPublic ? "Public" : "Private"}
                 </span>
-              ) : (
-                <span className="inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-semibold bg-gray-100 text-gray-600 border border-gray-200">
-                  Pending
-                </span>
-              )}
+              </div>
             </div>
 
             <div className="grid grid-cols-2 gap-4 mb-4">
@@ -629,25 +864,74 @@ export default function MyAssetsPage() {
                 )
               )}
 
-              {selectedAsset.valuations.length > 0 && (
+              {/* Financial assertions — valuations and sale-price proposals.
+                  Off-chain content (see requestFinancialAssertion), admin
+                  decides on-chain (decideFinancialAssertion). */}
+              {(assertions[selectedAsset.rawId.toString()] ?? []).length > 0 && (
                 <div className="p-3 bg-gray-50 border border-gray-100 rounded-xl">
-                  <span className="text-[9px] font-bold uppercase text-gray-400 block mb-2">On-Chain Valuations</span>
+                  <span className="text-[9px] font-bold uppercase text-gray-400 block mb-2">Financial Assertions</span>
                   <div className="space-y-1.5">
-                    {selectedAsset.valuations.map((v, i) => (
-                      <div key={i} className="flex justify-between items-center bg-white p-2 rounded border border-gray-100">
-                        <div>
+                    {(assertions[selectedAsset.rawId.toString()] ?? []).map((a) => {
+                      const isSeller = a.submittedBy.toLowerCase() === address?.toLowerCase();
+                      const isBuyer = !!a.counterparty && a.counterparty.toLowerCase() === address?.toLowerCase();
+                      const myConfirmed = isSeller ? a.sellerConfirmed : isBuyer ? a.buyerConfirmed : true;
+                      const canConfirm = a.status === 'PENDING' && !!a.counterparty && (isSeller || isBuyer) && !myConfirmed;
+                      return (
+                      <div key={a.txId} className="bg-white p-2 rounded border border-gray-100">
+                        <div className="flex justify-between items-center">
                           <span className="text-[9px] text-gray-400 block">
-                            Certifier: {v.certifier.slice(0, 6)}...{v.certifier.slice(-4)}
+                            {a.counterparty ? `Sale proposal → ${a.counterparty.slice(0, 6)}...${a.counterparty.slice(-4)}` : 'Valuation'}
                           </span>
-                          <span className="text-xs font-bold text-black">
-                            {Number(v.value).toLocaleString()} {decodeBytes3(v.currencyCode)}
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full ${
+                            a.status === 'APPROVED' ? 'bg-emerald-50 text-emerald-700'
+                              : a.status === 'REJECTED' ? 'bg-red-50 text-red-600'
+                              : 'bg-amber-50 text-amber-600'
+                          }`}>
+                            {a.status}
                           </span>
                         </div>
-                        <span className="text-[9px] text-gray-400 font-mono">
-                          {new Date(Number(v.certifiedAt) * 1000).toLocaleDateString("fr-FR")}
-                        </span>
+                        {a.counterparty && a.status === 'PENDING' && (
+                          <div className="flex gap-1 mt-1">
+                            <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded ${a.sellerConfirmed ? 'bg-emerald-50 text-emerald-600' : 'bg-gray-100 text-gray-400'}`}>
+                              Seller {a.sellerConfirmed ? '✓ confirmed' : 'waiting'}
+                            </span>
+                            <span className={`text-[8px] font-bold px-1.5 py-0.5 rounded ${a.buyerConfirmed ? 'bg-emerald-50 text-emerald-600' : 'bg-gray-100 text-gray-400'}`}>
+                              Buyer {a.buyerConfirmed ? '✓ confirmed' : 'waiting'}
+                            </span>
+                          </div>
+                        )}
+                        {a.erased ? (
+                          <p className="text-[10px] text-gray-400 italic mt-1">Cryptographically erased.</p>
+                        ) : a.data ? (
+                          <span className="text-xs font-bold text-black block mt-1">
+                            {a.counterparty
+                              ? `${Number((a.data as any).price).toLocaleString()} ${(a.data as any).currencyCode}`
+                              : `${Number((a.data as any).value).toLocaleString()} ${(a.data as any).currencyCode} — ${(a.data as any).entity}`}
+                          </span>
+                        ) : (
+                          <p className="text-[10px] text-gray-400 italic mt-1">Awaiting your signature to decrypt…</p>
+                        )}
+                        {canConfirm && (
+                          <button
+                            onClick={() => handleConfirmAssertion(a.txId)}
+                            disabled={confirmingTxId === a.txId}
+                            className="w-full mt-2 py-1.5 bg-black text-white rounded-lg text-[11px] font-bold hover:bg-gray-800 disabled:opacity-50 transition-all"
+                          >
+                            Confirm Price ({isSeller ? 'Seller' : 'Buyer'})
+                          </button>
+                        )}
+                        {a.status === 'APPROVED' && a.counterparty && isSeller && (
+                          <button
+                            onClick={() => handleCompleteSale(a)}
+                            disabled={isCompletingSale}
+                            className="w-full mt-2 py-1.5 bg-black text-white rounded-lg text-[11px] font-bold hover:bg-gray-800 disabled:opacity-50 transition-all"
+                          >
+                            Complete Transfer to Buyer
+                          </button>
+                        )}
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}
@@ -655,29 +939,26 @@ export default function MyAssetsPage() {
               <div className="p-3 bg-gray-50 border border-gray-100 rounded-xl">
                 {!isAddingValuation ? (
                   <button
-                    onClick={() => {
-                      setValuationCertifier(address ?? "");
-                      setIsAddingValuation(true);
-                    }}
+                    onClick={() => setIsAddingValuation(true)}
                     className="w-full text-center text-[11px] font-bold py-1.5 text-gray-600 hover:text-black transition-colors"
                   >
                     + Add Valuation
                   </button>
                 ) : (
                   <div className="space-y-2">
-                    <span className="text-[9px] font-bold uppercase text-gray-400 block">Certify a Valuation</span>
+                    <span className="text-[9px] font-bold uppercase text-gray-400 block">Submit a Valuation</span>
                     <input
                       type="text"
-                      placeholder="Certifier address (0x...)"
-                      value={valuationCertifier}
-                      onChange={(e) => setValuationCertifier(e.target.value)}
-                      className="w-full p-2 bg-white border border-gray-200 rounded-lg text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-black"
+                      placeholder="Entity (e.g. appraiser or gallery name)"
+                      value={valuationEntity}
+                      onChange={(e) => setValuationEntity(e.target.value)}
+                      className="w-full p-2 bg-white border border-gray-200 rounded-lg text-[11px] focus:outline-none focus:ring-1 focus:ring-black"
                     />
                     <div className="flex gap-2">
                       <input
                         type="text"
                         inputMode="numeric"
-                        placeholder="Value (smallest unit, e.g. cents)"
+                        placeholder="Value"
                         value={valuationValue}
                         onChange={(e) => setValuationValue(e.target.value)}
                         className="flex-1 p-2 bg-white border border-gray-200 rounded-lg text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-black"
@@ -687,7 +968,7 @@ export default function MyAssetsPage() {
                         onChange={(e) => setValuationCurrency(e.target.value as typeof valuationCurrency)}
                         className="p-2 bg-white border border-gray-200 rounded-lg text-[11px] font-bold focus:outline-none focus:ring-1 focus:ring-black"
                       >
-                        {CURRENCY_OPTIONS.map(c => <option key={c.code} value={c.code}>{c.code}</option>)}
+                        {CURRENCY_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
                       </select>
                     </div>
                     <div className="flex gap-2 pt-1">
@@ -702,12 +983,90 @@ export default function MyAssetsPage() {
                         disabled={isSubmittingValuation}
                         className="flex-1 py-1.5 bg-black text-white rounded-lg text-[11px] font-bold hover:bg-gray-800 disabled:opacity-50 transition-all"
                       >
-                        Certify
+                        Submit
                       </button>
                     </div>
                   </div>
                 )}
               </div>
+
+              {/* Propose Sale — a genuine pre-transfer negotiation step,
+                  separate from the card's plain no-price Transfer action. */}
+              {selectedAsset.status === "Active" && selectedAsset.owner.toLowerCase() === address?.toLowerCase() && (
+                <div className="p-3 bg-gray-50 border border-gray-100 rounded-xl">
+                  {!isProposingSale ? (
+                    <button
+                      onClick={() => setIsProposingSale(true)}
+                      className="w-full text-center text-[11px] font-bold py-1.5 text-gray-600 hover:text-black transition-colors"
+                    >
+                      + Propose Sale (negotiate a price)
+                    </button>
+                  ) : (
+                    <div className="space-y-2">
+                      <span className="text-[9px] font-bold uppercase text-gray-400 block">Propose a Sale Price</span>
+                      <input
+                        type="text"
+                        placeholder="Buyer address (0x...)"
+                        value={salePriceRecipient}
+                        onChange={(e) => setSalePriceRecipient(e.target.value)}
+                        className="w-full p-2 bg-white border border-gray-200 rounded-lg text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-black"
+                      />
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          placeholder="Price"
+                          value={salePriceValue}
+                          onChange={(e) => setSalePriceValue(e.target.value)}
+                          className="flex-1 p-2 bg-white border border-gray-200 rounded-lg text-[11px] font-mono focus:outline-none focus:ring-1 focus:ring-black"
+                        />
+                        <select
+                          value={salePriceCurrency}
+                          onChange={(e) => setSalePriceCurrency(e.target.value as typeof salePriceCurrency)}
+                          className="p-2 bg-white border border-gray-200 rounded-lg text-[11px] font-bold focus:outline-none focus:ring-1 focus:ring-black"
+                        >
+                          {CURRENCY_OPTIONS.map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
+                      </div>
+                      <p className="text-[9px] text-gray-400">The buyer must confirm, then admin must approve, before the transfer can complete.</p>
+                      <div className="flex gap-2 pt-1">
+                        <button
+                          onClick={() => setIsProposingSale(false)}
+                          className="flex-1 py-1.5 border border-gray-200 rounded-lg text-[11px] font-bold text-gray-500 hover:bg-gray-100 transition-all"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={handleProposeSale}
+                          disabled={isSubmittingSalePrice}
+                          className="flex-1 py-1.5 bg-black text-white rounded-lg text-[11px] font-bold hover:bg-gray-800 disabled:opacity-50 transition-all"
+                        >
+                          Propose
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Owner-only Explorer visibility toggle — never admin-settable
+                  for an existing asset, see setAssetVisibility's NatSpec. */}
+              {selectedAsset.owner.toLowerCase() === address?.toLowerCase() && (
+                <div className="p-3 bg-gray-50 border border-gray-100 rounded-xl flex justify-between items-center">
+                  <div>
+                    <span className="text-[9px] font-bold uppercase text-gray-400 block mb-0.5">Explorer Visibility</span>
+                    <span className="text-[10px] text-gray-400">Only you can change this — admin cannot.</span>
+                  </div>
+                  <button
+                    onClick={() => handleSetAssetVisibility(selectedAsset.rawId, !selectedAsset.isPublic)}
+                    className={`px-3 py-1.5 rounded-lg text-[11px] font-bold transition-all border ${
+                      selectedAsset.isPublic ? "bg-blue-50 text-blue-700 border-blue-200" : "bg-white text-gray-600 border-gray-200"
+                    }`}
+                  >
+                    {selectedAsset.isPublic ? "Public — make Private" : "Private — make Public"}
+                  </button>
+                </div>
+              )}
 
               <div className="p-3 bg-gray-50 border border-gray-100 rounded-xl">
                 <span className="text-[9px] font-bold uppercase text-gray-400 block mb-0.5">Contract</span>

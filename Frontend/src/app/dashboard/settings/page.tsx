@@ -19,7 +19,6 @@ export default function SettingsPage() {
   const [inactivePolicy, setInactivePolicy] = useState(0); 
   const [beneficiary, setBeneficiary] = useState("");
 
-  // read current user configuration from contract
   const { data: userConfig, refetch: refetchConfig } = useReadContract({
     address: ASSET_REGISTRY_ADDRESS,
     abi: ASSET_REGISTRY_ABI,
@@ -43,7 +42,7 @@ export default function SettingsPage() {
   const hasExited = exitStatusData ? (exitStatusData as [boolean, bigint, boolean])[1] > 0n : false;
 
   const [myPii, setMyPii] = useState<{ realName: string; email: string; address?: string } | null>(null);
-  const [piiStatus, setPiiStatus] = useState<'loading' | 'found' | 'erased' | 'not_stored'>('loading');
+  const [piiStatus, setPiiStatus] = useState<'loading' | 'found' | 'erased' | 'not_stored' | 'auth_declined'>('loading');
 
   // registerUser() is necessarily a user's first-ever transaction, so the
   // first entry in their (append-only) transaction list is the registration txId.
@@ -62,8 +61,14 @@ export default function SettingsPage() {
 
     (async () => {
       setPiiStatus('loading');
+      let authHeader: string;
       try {
-        const authHeader = await getAuthHeader(address, signMessageAsync);
+        authHeader = await getAuthHeader(address, signMessageAsync);
+      } catch {
+        setPiiStatus('auth_declined');
+        return;
+      }
+      try {
         const dataRes = await fetch(`${L2_SERVER_URL}/l3/data/${registrationTxId}?dataType=USER_PII`, {
           headers: { 'Authorization': authHeader },
         });
@@ -92,30 +97,43 @@ export default function SettingsPage() {
     query: { enabled: hasExited }
   });
 
-  // sync contract state with local react state
+  // Single place to read the on-chain config's current values — used both to
+  // seed local state below and, in the two handlers, to detect a no-op save
+  // (comparing edited local state back against this instead of a duplicate
+  // "last synced" state var that could itself drift out of sync).
+  const getOnChainConfig = () => {
+    const config = userConfig as any;
+    return {
+      assetsPublic: (config?.assetsPublic ?? config?.[0] ?? false) as boolean,
+      transactionsPublic: (config?.transactionsPublic ?? config?.[1] ?? false) as boolean,
+      inactivePolicy: Number(config?.inactivePolicy ?? config?.[2] ?? 0),
+      beneficiary: (config?.inactiveBeneficiary ?? config?.[3] ?? "0x0000000000000000000000000000000000000000") as string,
+    };
+  };
+
   useEffect(() => {
     if (userConfig) {
-      const config = userConfig as any;
-      
-      const onChainAssetsPublic = config.assetsPublic ?? config[0] ?? false;
-      const onChainTxPublic = config.transactionsPublic ?? config[1] ?? false;
-      const onChainPolicy = config.inactivePolicy ?? config[2] ?? 0;
-      const onChainBeneficiary = config.inactiveBeneficiary ?? config[3] ?? "";
+      const onChain = getOnChainConfig();
 
-      setAssetsPublic(onChainAssetsPublic);
-      setTransactionsPublic(onChainTxPublic);
-      setInactivePolicy(Number(onChainPolicy));
-      
-      if (onChainBeneficiary && onChainBeneficiary !== "0x0000000000000000000000000000000000000000") {
-        setBeneficiary(onChainBeneficiary);
-      } else if (Number(onChainPolicy) !== 1) {
+      setAssetsPublic(onChain.assetsPublic);
+      setTransactionsPublic(onChain.transactionsPublic);
+      setInactivePolicy(onChain.inactivePolicy);
+
+      if (onChain.beneficiary !== "0x0000000000000000000000000000000000000000") {
+        setBeneficiary(onChain.beneficiary);
+      } else if (onChain.inactivePolicy !== 1) {
         setBeneficiary("");
       }
     }
   }, [userConfig]);
 
-  // update privacy preferences on-chain
   const handleSaveVisibility = async () => {
+    const onChain = getOnChainConfig();
+    if (assetsPublic === onChain.assetsPublic && transactionsPublic === onChain.transactionsPublic) {
+      toast("No changes to save.");
+      return;
+    }
+
     const toastId = toast.loading("Updating privacy settings on-chain...");
     try {
       const tx = await writeContractAsync({
@@ -133,16 +151,21 @@ export default function SettingsPage() {
     }
   };
 
-  // update inheritance backup rules on-chain
   const handleSavePolicy = async () => {
     if (inactivePolicy === 1 && !isAddress(beneficiary)) {
       toast.error("Please enter a valid beneficiary wallet address");
       return;
     }
 
+    const targetBeneficiary = inactivePolicy === 1 ? beneficiary : "0x0000000000000000000000000000000000000000";
+    const onChain = getOnChainConfig();
+    if (inactivePolicy === onChain.inactivePolicy && targetBeneficiary.toLowerCase() === onChain.beneficiary.toLowerCase()) {
+      toast("No changes to save.");
+      return;
+    }
+
     const toastId = toast.loading("Securing inheritance policy...");
     try {
-      const targetBeneficiary = inactivePolicy === 1 ? beneficiary : "0x0000000000000000000000000000000000000000";
       await writeContractAsync({
         address: ASSET_REGISTRY_ADDRESS,
         abi: ASSET_REGISTRY_ABI,
@@ -158,7 +181,6 @@ export default function SettingsPage() {
     }
   };
 
-  // request RTBF account exit protocol
   const handleExit = async () => {
     if (!isAddress(confirmAddress)) {
       toast.error("Please enter a valid wallet address");
@@ -225,9 +247,14 @@ export default function SettingsPage() {
             Your registration data has been cryptographically erased following an RTBF exit.
           </p>
         )}
+        {piiStatus === 'auth_declined' && (
+          <p className="text-xs text-amber-700 bg-amber-50 rounded-xl p-4 border border-amber-200">
+            Signature declined — sign the authorization prompt to view your registered PII.
+          </p>
+        )}
         {piiStatus === 'not_stored' && (
           <p className="text-xs text-gray-400 italic bg-gray-50 rounded-xl p-4 border border-dashed">
-            No PII on record for this session (e.g. a seeded account with no real registration flow).
+            No PII registered for this account.
           </p>
         )}
       </Card>

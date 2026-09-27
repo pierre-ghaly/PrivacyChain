@@ -40,3 +40,9 @@ shared/deployments/localhost.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Paper drafting — not part of the software project, kept out of this repo's history
+paper/
+
+# Ad hoc scratch/diagnostic files, never meant to be committed
+.tmp-*
