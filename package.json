@@ -29,6 +29,6 @@
   "author": "Pierre Ghaly",
   "license": "ISC",
   "overrides": {
-    "@coinbase/cdp-sdk": "1.51.0"
+    "@coinbase/cdp-sdk": "1.57.1"
   }
 }
